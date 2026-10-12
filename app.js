@@ -399,8 +399,11 @@ async function runJob(label, writes, done) {
   try {
     const res = await api("write", "POST", { writes });
     if (!res.ok) {
-      const bad = (res.results || []).find((r) => !r.ok);
-      throw new Error(bad?.reason ? `Cozytouch a refusé : ${bad.reason}` : "Cozytouch a refusé la commande");
+      const bad = (res.results || []).filter((r) => !r.ok);
+      const okCount = (res.results || []).length - bad.length;
+      const what = bad.map((b) => CAP_LABEL[b.capabilityId] || `réglage ${b.capabilityId}`).join(", ");
+      const why = (bad[0]?.reason || "").replace(/^refus /, "");
+      throw new Error(`Cozytouch a refusé ${what}${why ? ` (${why})` : ""}${okCount ? `, le reste est passé` : ""}.`);
     }
     job.status = "verifying"; job.detail = "Envoyé, vérification sur les radiateurs…"; renderJobs();
     for (const wait of [4000, 10000, 25000, 45000]) {
@@ -414,6 +417,7 @@ async function runJob(label, writes, done) {
     }
   } catch (e) {
     job.status = "failed"; job.detail = e.message;
+    refresh({ quiet: true }); // une partie a pu passer : on affiche l'état réel
   }
   renderJobs(); render();
   if (job.status === "done") { done && done(); setTimeout(() => dismissJob(job.id), 3500); }
@@ -431,6 +435,11 @@ function renderJobs() {
   }).join("");
 }
 
+const CAP_LABEL = { [C.POWER]: "la marche/arrêt", [C.TARGET]: "la consigne", [C.OVERRIDE]: "la dérogation",
+  [C.OVERRIDE_TOTAL]: "la durée de dérogation", [C.OVERRIDE_LEFT]: "le temps restant", [C.PROG]: "le mode programme",
+  [C.COMFORT_T]: "la température confort", [C.ECO_T]: "la température éco", [C.NIGHT_T]: "la température nuit" };
+DAY_IDS.forEach((id, k) => { CAP_LABEL[id] = `le planning du ${DAYS[k].toLowerCase()}`; });
+
 // Écritures types
 const W = (room, cap, value) => ({ deviceId: room.id, capabilityId: cap, value: String(value) });
 function writesPower(room, on) { return [W(room, C.POWER, on ? ON : OFF)]; }
@@ -440,7 +449,7 @@ function writesTarget(room, t) {
 }
 function writesMode(room, prog) {
   const w = [W(room, C.PROG, prog ? "1" : "0")];
-  if (room.override) w.unshift(W(room, C.OVERRIDE_LEFT, "0"), W(room, C.OVERRIDE, "0"));
+  if (room.override) w.unshift(W(room, C.OVERRIDE, "0"));
   return w;
 }
 function writesOverride(room, t, minutes) {
@@ -450,7 +459,7 @@ function writesOverride(room, t, minutes) {
   w.push(W(room, C.OVERRIDE_TOTAL, minutes), W(room, C.OVERRIDE, "1"), W(room, C.TARGET, t));
   return w;
 }
-function writesCancelOverride(room) { return [W(room, C.OVERRIDE_LEFT, "0"), W(room, C.OVERRIDE, "0")]; }
+function writesCancelOverride(room) { return [W(room, C.OVERRIDE, "0")]; }
 const clampT = (room, t) => Math.min(room.max, Math.max(room.min, Math.round(t / room.step) * room.step));
 
 // ---------- Rendu
