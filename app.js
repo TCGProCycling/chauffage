@@ -36,6 +36,9 @@ const I = {
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
   clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   boost: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
+  leaf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19c0-8 5-13 15-14-1 10-6 15-14 15"/><path d="M5 19l7-7"/></svg>',
+  target: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
+  thermo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 14V5a2 2 0 1 1 4 0v9a4 4 0 1 1-4 0z"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
 };
 
@@ -465,9 +468,11 @@ const clampT = (room, t) => Math.min(room.max, Math.max(room.min, Math.round(t /
 // ---------- Rendu
 function render() {
   const app = $("#app");
+  // Ne pas effacer le questionnaire en cours de saisie lors d'une actualisation automatique
+  if (S.tab === "optim" && (!habits.done || S.editHabits) && $("#h-wake")) return;
   if (!cfg.demo && !cfg.url) { app.innerHTML = welcomeView(); bindWelcome(); return; }
   const scrollY = window.scrollY;
-  app.innerHTML = `<div class="wrap">${topView()}${S.tab === "rooms" ? roomsView() : S.tab === "plan" ? planView() : consoView()}</div>${navView()}`;
+  app.innerHTML = `<div class="wrap">${topView()}${S.tab === "rooms" ? roomsView() : S.tab === "plan" ? planView() : S.tab === "optim" ? optimView() : consoView()}</div>${navView()}`;
   window.scrollTo(0, scrollY);
 }
 function renderTop() { const el = $("#refresh"); if (el) el.classList.toggle("spin", S.loading); }
@@ -481,6 +486,7 @@ function topView() {
       `${onCount} pièce${onCount > 1 ? "s" : ""} sur ${rs.length} ${onCount > 1 ? "chauffent" : "chauffe"}`;
   } else if (S.tab === "plan") title = "Planning";
   else if (S.tab === "conso") title = "Consommation";
+  else if (S.tab === "optim") title = "Optimiser";
   const h = health();
   const sub = S.error ? `<span style="color:var(--alert)">${esc(S.error)}</span>` :
     S.fetchedAt ? `Données reçues ${ago(Math.round((Date.now() - S.fetchedAt) / 1000))}${S.fromCache ? " (hors ligne)" : ""}` : "Chargement…";
@@ -493,15 +499,15 @@ function topView() {
   if (abs?.startDate && abs?.endDate && abs.endDate > nowS()) {
     banners += `<div class="banner info">${I.bag}<div class="b-body"><strong>Mode vacances</strong> jusqu'au ${dateFr(abs.endDate)}.<br><button class="btn" data-act="absence-stop">Arrêter le mode vacances</button></div></div>`;
   }
-  const out = S.weather?.now != null ? `<br>Dehors à ${esc(cfg.place.name)} : ${deg(S.weather.now)}°` : "";
-  return `<header class="top"><div class="status"><h1>${esc(title)}</h1><p class="muted">${sub}${out}</p></div>
+  const out = S.weather?.now != null ? `<span class="pill">${I.thermo}${esc(cfg.place.name)} ${deg(S.weather.now)}°</span>` : "";
+  return `<header class="top"><div class="status"><h1>${esc(title)}</h1><p class="muted">${out}<span>${sub}</span></p></div>
     <button class="iconbtn${S.loading ? " spin" : ""}" id="refresh" data-act="refresh" aria-label="Actualiser">${I.refresh}</button>
     <button class="iconbtn" data-act="settings" aria-label="Réglages">${I.gear}</button></header>${banners}`;
 }
 
 function navView() {
   const t = (id, label, icon) => `<button role="tab" aria-selected="${S.tab === id}" data-tab="${id}">${icon}${label}</button>`;
-  return `<nav class="tabs" role="tablist"><div class="inner">${t("rooms", "Pièces", I.rooms)}${t("plan", "Planning", I.plan)}${t("conso", "Conso", I.conso)}</div></nav>`;
+  return `<nav class="tabs" role="tablist"><div class="inner">${t("rooms", "Pièces", I.rooms)}${t("plan", "Planning", I.plan)}${t("optim", "Optimiser", I.leaf)}${t("conso", "Conso", I.conso)}</div></nav>`;
 }
 
 function heatPct(t) { if (t == null) return 30; return Math.round(Math.min(100, Math.max(0, (t - 15) / 7 * 100))); }
@@ -511,26 +517,20 @@ function roomsView() {
   if (!rs.length) return `<div class="empty">${S.error ? "Impossible de lire tes radiateurs pour l'instant." : "Chargement de tes pièces…"}</div>`;
   const pend = pendingRoomIds();
   const work = rs.find((r) => r.name.toLowerCase() === String(cfg.work.room).toLowerCase());
-  const scenes = `<div class="scenes" role="group" aria-label="Scènes">
-    <button class="scene" data-act="all-on">${I.power}Tout allumer</button>
-    <button class="scene" data-act="all-off">${I.moon}Tout éteindre</button>
-    ${work ? `<button class="scene" data-act="work">${I.laptop}Télétravail</button>` : ""}
-    <button class="scene" data-act="vacation">${I.bag}Vacances</button></div>`;
+  const scenes = `<div class="scenes${work ? "" : " three"}" role="group" aria-label="Scènes">
+    <button class="scene" data-act="all-on">${I.power}<span>Tout allumer</span></button>
+    <button class="scene" data-act="all-off">${I.moon}<span>Tout éteindre</span></button>
+    ${work ? `<button class="scene" data-act="work">${I.laptop}<span>Télétravail</span></button>` : ""}
+    <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button></div>`;
   const tiles = rs.map((r) => {
-    const chips = [];
-    if (r.temp == null) chips.push("Mesure ancienne");
-    if (!r.on) chips.push("Éteint");
-    else {
-      chips.push(`Consigne ${deg(r.target)}°`);
-      if (r.override) chips.push(`Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}`);
-      else chips.push(r.prog ? "Prog" : "Manuel");
-      if (r.heating) chips.push(`<span class="chip flame">${I.flame}Chauffe</span>`);
-    }
+    const mode = !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
+    const badge = pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>'
+      : !r.on ? `<span class="badge">${I.power}</span>` : r.heating ? `<span class="badge hot" title="Chauffe">${I.flame}</span>` : "";
     return `<button class="tile${r.on ? "" : " off"}" style="--heat:${heatPct(r.temp)}%" data-room="${r.id}" aria-label="${esc(r.name)}, ${r.temp != null ? deg(r.temp) + " degrés" : "température inconnue"}, ${r.on ? "allumé" : "éteint"}">
-      ${pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>' : ""}
-      <span class="name">${esc(r.name)}</span>
-      <span class="temp num">${r.temp != null ? deg(r.temp) + "<sup>°</sup>" : "–"}</span>
-      <span class="meta">${chips.map((c) => c.startsWith("<span") ? c : `<span class="chip">${c}</span>`).join("")}</span></button>`;
+      <span class="t-top"><span class="name">${esc(r.name)}</span>${badge}</span>
+      <span class="temp num">${r.temp != null ? deg(r.temp) + "<sup>°</sup>" : `<span class="nodata">–</span>`}</span>
+      <span class="t-foot">${r.on ? `<span class="target num">${I.target}${deg(r.target)}°</span>` : ""}<span class="mode">${esc(mode)}</span></span>
+      ${r.temp == null ? `<span class="stale">Mesure ancienne</span>` : ""}</button>`;
   }).join("");
   return scenes + `<div class="rooms">${tiles}</div>`;
 }
@@ -687,6 +687,167 @@ function linkyView(d) {
     ${radShare != null && hpShare != null ? `<p class="help">Sur les 7 derniers jours, ${hpShare} % de la conso de la maison tombe en heures pleines.</p>` : ""}
     <div class="chart" id="chart2"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Consommation de la maison par jour"><line x1="0" x2="${W_}" y1="${H - padB}" y2="${H - padB}" stroke="var(--line)"/>${bars}</svg><div class="tip hidden" id="tip2"></div></div>
     <p class="help">Données Enedis, mises à jour une fois par jour (la veille).</p></div>`;
+}
+
+// ---------- Optimiser : programme proposé à partir des habitudes
+const USAGES = {
+  bedroom: { label: "Chambre", t: { 1: 18, 2: 16, 3: 17 } },
+  office: { label: "Bureau", t: { 1: 19, 2: 16, 3: 16 } },
+  living: { label: "Pièce de vie", t: { 1: 19, 2: 16, 3: 17 } },
+  bath: { label: "Salle de bain", t: { 1: 22, 2: 17, 3: 17 } },
+  guest: { label: "Chambre d'amis (rarement occupée)", t: { 1: 18, 2: 16, 3: 16 } },
+  skip: { label: "Ne pas toucher à cette pièce", t: null },
+};
+const toMin = (s) => { const [h, m] = String(s || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
+function guessUsage(name) {
+  const n = name.toLowerCase();
+  if (/bain|sdb|douche/.test(n)) return "bath";
+  if (/bureau/.test(n)) return "office";
+  if (/ami|invit/.test(n)) return "guest";
+  if (/chambre/.test(n)) return "bedroom";
+  return "living";
+}
+function defaultHabits() {
+  return { week: { wake: "07:00", leave: "08:30", back: "18:30", bed: "23:00" }, weekend: { wake: "08:30", bed: "23:30", out: false },
+    tt: [false, false, false, false, false], feel: "normal", usage: {}, done: false };
+}
+let habits = Object.assign(defaultHabits(), store.get("habits", {}));
+const usageOf = (r) => habits.usage[r.id] || guessUsage(r.name);
+
+function cleanPoints(pts) {
+  const byMin = new Map();
+  for (const p of pts) byMin.set(Math.max(0, Math.min(1425, Math.round(p.min / 15) * 15)), p.level);
+  const sorted = [...byMin.entries()].sort((a, b) => a[0] - b[0]).map(([min, level]) => ({ min, level }));
+  return sorted.filter((p, i) => i === 0 || p.level !== sorted[i - 1].level).slice(0, 10);
+}
+function proposal(room) {
+  const u = usageOf(room);
+  if (u === "skip" || !USAGES[u].t) return null;
+  const t = { ...USAGES[u].t };
+  if (habits.feel === "frileux") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
+  if (habits.feel === "frais") t[1] = Math.max(17, t[1] - 1);
+  const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
+  const week = [];
+  for (let d = 0; d < 7; d++) {
+    const we = d >= 5;
+    const wake = toMin(we ? habits.weekend.wake : habits.week.wake);
+    const bed = toMin(we ? habits.weekend.bed : habits.week.bed);
+    const home = we ? !habits.weekend.out : !!habits.tt[d];
+    const leave = we ? 10 * 60 : toMin(habits.week.leave);
+    const back = we ? 18 * 60 : toMin(habits.week.back);
+    let p = [];
+    if (u === "bedroom") p = [{ min: wake - 30, level: 1 }, { min: wake + 30, level: 2 }, { min: bed - 60, level: 1 }, { min: bed, level: 3 }];
+    if (u === "bath") p = [{ min: wake - 30, level: 1 }, { min: wake + 45, level: 2 }, { min: bed - 90, level: 1 }, { min: bed - 30, level: 3 }];
+    if (u === "office") p = home ? [{ min: wake, level: 1 }, { min: Math.max(wake + 60, 19 * 60), level: 2 }, { min: bed, level: 3 }] : [{ min: wake, level: 2 }, { min: bed, level: 3 }];
+    if (u === "living") p = home ? [{ min: wake - 30, level: 1 }, { min: bed, level: 3 }]
+      : [{ min: wake - 30, level: 1 }, { min: leave, level: 2 }, { min: back - 45, level: 1 }, { min: bed, level: 3 }];
+    if (u === "guest") p = [{ min: 0, level: 2 }];
+    // Heures creuses du matin : la montée en confort démarre avant la fin du tarif réduit si le réveil est juste après
+    for (const e of morningHC) for (const x of p) if (x.level === 1 && x.min > e && x.min <= e + 90) x.min = e - 30;
+    week.push(cleanPoints(p));
+  }
+  return { usage: u, t, week };
+}
+// Consigne moyenne sur la semaine (pas de 15 min), pour estimer l'effet des changements
+function avgSetpoint(week, temps) {
+  const fake = { week };
+  let sum = 0, n = 0;
+  for (let d = 0; d < 7; d++) for (let m = 0; m < 1440; m += 15) { const l = levelAt(fake, d, m); if (temps[l] != null) { sum += temps[l]; n++; } }
+  return n ? sum / n : null;
+}
+function estimate(room, prop) {
+  const cur = avgSetpoint(room.week, room.levels), next = avgSetpoint(prop.week, prop.t);
+  if (cur == null || next == null) return null;
+  return { cur, next, pct: Math.round((cur - next) * 7) }; // ADEME : environ 7 % par degré
+}
+function barHTML(week, di) {
+  const fake = { week };
+  const pts = week[di];
+  const segs = []; let cursor = 0, lvl = levelAt(fake, di, 0);
+  for (const p of pts) { if (p.min > cursor) segs.push([cursor, p.min, lvl]); cursor = Math.max(cursor, p.min); lvl = p.level; }
+  segs.push([cursor, 1440, lvl]);
+  return `<span class="bar slim">${segs.filter((s) => s[1] > s[0]).map((s) => `<i style="flex:${s[1] - s[0]};background:${LEVELS[s[2]]?.color || "var(--surface-2)"}"></i>`).join("")}</span>`;
+}
+function writesProposal(room, prop) {
+  const w = [];
+  for (const k of [1, 2, 3]) {
+    let second = 0; try { second = JSON.parse(room.levelsRaw[k])[1] ?? 0; } catch { /* rien */ }
+    const val = JSON.stringify([prop.t[k], second]);
+    if (!sameValue(LEVELS[k].cap, room.levelsRaw[k], val)) w.push(W(room, LEVELS[k].cap, val));
+  }
+  prop.week.forEach((pts, k) => { const v = serializeDay(pts); if (!sameValue(DAY_IDS[k], room.weekRaw[k], v)) w.push(W(room, DAY_IDS[k], v)); });
+  if (room.on && !room.prog) w.push(W(room, C.PROG, "1"));
+  return w;
+}
+
+function optimView() {
+  const rs = rooms().filter((r) => r.hasSchedule);
+  if (!rs.length) return `<div class="empty">Chargement de tes pièces…</div>`;
+  if (!habits.done || S.editHabits) return habitsForm(rs);
+  const items = rs.map((r) => ({ r, prop: proposal(r) })).filter((x) => x.prop);
+  const weights = items.map((x) => x.r.watts || 1000);
+  const ests = items.map((x) => estimate(x.r, x.prop));
+  const tot = weights.reduce((a, b) => a + b, 0);
+  const global = Math.round(ests.reduce((s, e, i) => s + (e ? e.pct * weights[i] : 0), 0) / Math.max(1, tot));
+  const cards = items.map(({ r, prop }, i) => {
+    const e = ests[i];
+    const w = writesProposal(r, prop);
+    const temps = [1, 2, 3].map((k) => `<span class="chg"><i style="background:${LEVELS[k].color}"></i>${LEVELS[k].label} ${deg(r.levels[k])}°${Math.abs((r.levels[k] ?? 0) - prop.t[k]) > 0.01 ? ` <b>→ ${deg(prop.t[k])}°</b>` : ""}</span>`).join("");
+    return `<div class="card opt">
+      <div class="opt-head"><div><h2 class="sec" style="margin:0">${esc(r.name)}</h2><span class="muted">${esc(USAGES[prop.usage].label)}</span></div>
+        ${e ? `<span class="gain ${e.pct > 0 ? "good" : e.pct < 0 ? "bad" : ""}">${e.pct > 0 ? "−" + e.pct : e.pct < 0 ? "+" + -e.pct : "≈ 0"} %</span>` : ""}</div>
+      <div class="chgs">${temps}</div>
+      <div class="cmp"><span class="lbl">Semaine</span><span class="tag">Actuel</span>${barHTML(r.week, 0)}<span></span><span class="tag">Proposé</span>${barHTML(prop.week, 0)}
+        <span class="lbl">Week-end</span><span class="tag">Actuel</span>${barHTML(r.week, 5)}<span></span><span class="tag">Proposé</span>${barHTML(prop.week, 5)}</div>
+      <p class="help">${esc(prop.week[0].map((p) => `${hhmm(p.min)} ${LEVELS[p.level].label.toLowerCase()}`).join(", "))} en semaine.${!r.on ? " La pièce est éteinte : ce programme servira quand tu la rallumeras." : ""}</p>
+      ${w.length ? `<button class="btn primary block" data-opt-apply="${r.id}">Appliquer à ${esc(r.name)}</button>` : `<p class="help"><b>Déjà appliqué.</b></p>`}
+    </div>`;
+  }).join("");
+  return `<div class="card hero-opt"><span class="muted">Économie estimée sur le chauffage</span>
+      <b class="num big">${global > 0 ? "−" + global : global < 0 ? "+" + -global : "≈ 0"} %</b>
+      <p class="help">Calcul à partir de la consigne moyenne de chaque pièce sur la semaine, avec le repère de l'ADEME : environ 7 % de conso en moins par degré. C'est un ordre de grandeur, la conso réelle tranchera.</p>
+      <button class="btn" data-act="habits-edit">Modifier mes habitudes</button></div>
+    ${cards}
+    ${leversView()}`;
+}
+function leversView() {
+  const tips = [
+    ["19° dans les pièces de vie, 17° dans les chambres", "Ce sont les repères de l'ADEME. Chaque degré en moins, c'est environ 7 % de conso en moins."],
+    ["Moins chauffer quand personne n'est là", "Une pièce vide à 16° plutôt qu'à 19° économise sans se voir, à condition de relancer le confort avant ton retour."],
+    [`Monter en température pendant les heures creuses (${hcText()})`, "C'est la phase qui consomme le plus. Le programme proposé l'avance quand ton réveil tombe juste après la fin du tarif réduit."],
+    ["Vacances : mode hors-gel", "Pour toute absence de plus d'un jour, le bouton Vacances coupe le confort et le relance avant ton retour."],
+    ["Laisser faire la détection de fenêtre", "Tes radiateurs Atlantic se mettent en pause quand une fenêtre s'ouvre : aère 5 à 10 minutes, fenêtre grande ouverte."],
+  ];
+  return `<div class="card"><h2 class="sec" style="margin-top:0">Les bons réflexes</h2>${tips.map(([t, d]) => `<div class="tip-row"><b>${esc(t)}</b><p class="help">${esc(d)}</p></div>`).join("")}</div>`;
+}
+function habitsForm(rs) {
+  const h = habits;
+  const time = (id, v, label) => `<label class="field"><span>${label}</span><input type="time" step="900" id="${id}" value="${esc(v)}"></label>`;
+  return `<div class="card"><h2 class="sec" style="margin-top:0">Parle-moi de tes journées</h2>
+      <p class="help">Quelques questions sur ton rythme. L'appli en déduit un programme pièce par pièce, que tu valides avant qu'il soit envoyé.</p></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">En semaine</h2>
+      <div class="grid2">${time("h-wake", h.week.wake, "Lever")}${time("h-bed", h.week.bed, "Coucher")}${time("h-leave", h.week.leave, "Départ de la maison")}${time("h-back", h.week.back, "Retour")}</div>
+      <p class="help" style="margin-top:4px">Les jours où tu télétravailles :</p>
+      <div class="daypick">${DAYS_SHORT.slice(0, 5).map((d, k) => `<label><input type="checkbox" data-tt="${k}" ${h.tt[k] ? "checked" : ""}>${d}</label>`).join("")}</div></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">Le week-end</h2>
+      <div class="grid2">${time("h-wwake", h.weekend.wake, "Lever")}${time("h-wbed", h.weekend.bed, "Coucher")}</div>
+      <label class="daypick"><label><input type="checkbox" id="h-out" ${h.weekend.out ? "checked" : ""}>Souvent dehors la journée</label></label></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">Ton ressenti</h2>
+      <div class="seg" role="group">${[["frileux", "Frileux"], ["normal", "Normal"], ["frais", "J'aime le frais"]].map(([v, l]) => `<button type="button" aria-pressed="${h.feel === v}" data-feel="${v}">${l}</button>`).join("")}</div></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">À quoi sert chaque pièce ?</h2>
+      ${rs.map((r) => `<label class="field"><span>${esc(r.name)}</span><select data-usage="${r.id}">${Object.entries(USAGES).map(([k, v]) => `<option value="${k}" ${usageOf(r) === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>`).join("")}</div>
+    <button class="btn primary block" data-act="habits-save">Voir le programme proposé</button><p></p>`;
+}
+function saveHabits() {
+  const v = (id) => $("#" + id)?.value;
+  habits.week = { wake: v("h-wake"), bed: v("h-bed"), leave: v("h-leave"), back: v("h-back") };
+  habits.weekend = { wake: v("h-wwake"), bed: v("h-wbed"), out: $("#h-out").checked };
+  habits.tt = [0, 1, 2, 3, 4].map((k) => $(`[data-tt="${k}"]`).checked);
+  habits.feel = $("[data-feel][aria-pressed='true']")?.dataset.feel || "normal";
+  document.querySelectorAll("[data-usage]").forEach((s) => { habits.usage[s.dataset.usage] = s.value; });
+  habits.done = true; S.editHabits = false;
+  store.set("habits", habits);
+  render(); window.scrollTo(0, 0);
 }
 
 // ---------- Feuilles (fenêtres du bas)
@@ -946,7 +1107,7 @@ function bindWelcome() {
     try { await api("state"); store.set("cfg", cfg); render(); refresh(); loadWeather(); }
     catch (e) { $("#w-err").textContent = e.message; cfg.url = ""; }
   };
-  if ($("#w-demo")) $("#w-demo").onclick = () => { cfg.demo = true; store.set("cfg", cfg); render(); refresh(); };
+  if ($("#w-demo")) $("#w-demo").onclick = () => { cfg.demo = true; store.set("cfg", cfg); render(); refresh(); loadWeather(); };
 }
 
 // ---------- Actions globales
@@ -954,7 +1115,7 @@ function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0
 
 document.addEventListener("click", (e) => {
   if (sheetEl && sheetEl.contains(e.target)) return;
-  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco]");
+  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel]");
   if (!t) return;
   if (t.dataset.tab) return setTab(t.dataset.tab);
   if (t.dataset.room) return openRoom(+t.dataset.room);
@@ -963,12 +1124,20 @@ document.addEventListener("click", (e) => {
   if (t.dataset.level) return openLevel(S.planRoom, +t.dataset.level);
   if (t.dataset.retry) return retryJob(+t.dataset.retry);
   if (t.dataset.dismiss) return dismissJob(+t.dataset.dismiss);
+  if (t.dataset.optApply) {
+    const r = roomById(+t.dataset.optApply); const prop = proposal(r);
+    if (r && prop && confirm(`Envoyer le programme proposé à ${r.name} ?`)) runJob(`${r.name} : programme optimisé`, writesProposal(r, prop));
+    return;
+  }
+  if (t.dataset.feel) { document.querySelectorAll("[data-feel]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
   if (t.dataset.reco) { const r = S.recos?.[+t.dataset.reco]; if (r && confirm(`${r.title} ?`)) applyReco(r); return; }
   const a = t.dataset.act;
   const rs = rooms();
   if (a === "refresh") refresh();
   if (a === "settings") openSettings();
   if (a === "conso-retry") { S.consoError = null; S.conso = null; render(); }
+  if (a === "habits-save") return saveHabits();
+  if (a === "habits-edit") { S.editHabits = true; render(); window.scrollTo(0, 0); return; }
   if (a === "linky-retry") { S.linkyError = null; S.linky = null; loadLinky(true); render(); }
   if (a === "all-on") {
     const writes = rs.flatMap((r) => [...(!r.on ? writesPower(r, true) : []), ...(!r.prog ? [W(r, C.PROG, "1")] : [])]);
