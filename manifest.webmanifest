@@ -1,0 +1,16 @@
+{
+  "name": "Chauffage",
+  "short_name": "Chauffage",
+  "description": "Pilotage des radiateurs de la maison",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#E7ECEF",
+  "theme_color": "#1F5F99",
+  "lang": "fr",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
