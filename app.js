@@ -47,10 +47,13 @@ const store = {
 };
 
 const DEFAULT_CFG = { url: "", code: "", demo: false, staleHours: 3,
-  work: { room: "Bureau", temp: 20, hours: 8 }, boost: { delta: 2, minutes: 60 } };
+  work: { room: "Bureau", temp: 20, hours: 8 }, boost: { delta: 2, minutes: 60 },
+  hc: "01:04-07:04, 14:04-16:04",
+  place: { name: "Rezé", lat: 47.1797, lon: -1.5494 } };
 let cfg = Object.assign({}, DEFAULT_CFG, store.get("cfg", {}));
 cfg.work = Object.assign({}, DEFAULT_CFG.work, cfg.work);
 cfg.boost = Object.assign({}, DEFAULT_CFG.boost, cfg.boost);
+cfg.place = Object.assign({}, DEFAULT_CFG.place, cfg.place);
 
 const S = {
   setup: null, conso: null, serverNow: 0, fetchedAt: 0, loading: false, error: null,
@@ -119,8 +122,10 @@ function rooms() {
       name: v(C.NAME) || d.name,
       model: rad ? rad.longName : "",
       watts: rc[C.POWER_W] ? num(rc[C.POWER_W].value) : null,
-      temp: tempOk ? num(v(C.TEMP)) : null,
+      // Température masquée si la dernière mesure est trop ancienne
+      lastTemp: tempOk ? num(v(C.TEMP)) : null,
       tempAt: c[C.TEMP]?.modificationDate || 0,
+      get temp() { return this.tempAt && nowS() - this.tempAt < cfg.staleHours * 3600 ? this.lastTemp : null; },
       target: num(v(C.TARGET)),
       min: num(v(C.MIN)) ?? 7, max: num(v(C.MAX)) ?? 28, step: num(v(C.STEP)) || 0.5,
       on: v(C.POWER) != null && v(C.POWER) !== OFF,
@@ -247,6 +252,123 @@ async function loadConso() {
   if (S.tab === "conso") render();
 }
 
+// ---------- Heures creuses
+function parseHC(str) {
+  const out = [];
+  for (const part of String(str || "").split(/[,;]/)) {
+    const m = part.match(/(\d{1,2})[h:](\d{2})?\s*(?:-|à|a)\s*(\d{1,2})[h:](\d{2})?/i);
+    if (m) out.push([+m[1] * 60 + +(m[2] || 0), +m[3] * 60 + +(m[4] || 0)]);
+  }
+  return out;
+}
+function isHC(min) {
+  return parseHC(cfg.hc).some(([a, b]) => (a <= b ? min >= a && min < b : min >= a || min < b));
+}
+const hcText = () => parseHC(cfg.hc).map(([a, b]) => `${hhmm(a)} à ${hhmm(b)}`).join(" et ");
+
+// ---------- Météo (Open-Meteo, gratuit, sans clé)
+async function loadWeather() {
+  const c = store.get("weather", null);
+  if (c && Date.now() - c.at < 30 * 60000 && c.lat === cfg.place.lat) { S.weather = c; return; }
+  try {
+    const u = `https://api.open-meteo.com/v1/forecast?latitude=${cfg.place.lat}&longitude=${cfg.place.lon}` +
+      "&current=temperature_2m&daily=temperature_2m_mean,temperature_2m_min,temperature_2m_max&past_days=31&forecast_days=3&timezone=Europe%2FParis";
+    const r = await fetch(u);
+    const d = await r.json();
+    const daily = {};
+    (d.daily?.time || []).forEach((t, i) => { daily[t] = { mean: d.daily.temperature_2m_mean[i], min: d.daily.temperature_2m_min[i], max: d.daily.temperature_2m_max[i] }; });
+    S.weather = { at: Date.now(), lat: cfg.place.lat, now: d.current?.temperature_2m, daily };
+    store.set("weather", S.weather);
+  } catch { /* météo facultative */ }
+  render();
+}
+const dayKey = (ts) => { const d = new Date(ts * 1000); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+
+// ---------- Linky (via le relais)
+async function loadLinky(force = false) {
+  const c = store.get("linky", null);
+  if (!force && c && Date.now() - c.at < 6 * 3600000) { S.linky = c.data; return; }
+  if (cfg.demo) { S.linky = { configured: false, demo: true }; return; }
+  try {
+    const d = await api("linky" + (force ? "&force=1" : ""));
+    S.linky = d; S.linkyError = null;
+    store.set("linky", { at: Date.now(), data: d });
+  } catch (e) { S.linkyError = e.message; }
+  if (S.tab === "conso") render();
+}
+function linkySplit(curve) {
+  let hp = 0, hc = 0;
+  for (const p of curve || []) {
+    const end = new Date(p.end.replace(" ", "T"));
+    const start = new Date(end.getTime() - 30 * 60000);
+    const kwh = (p.w || 0) * 0.5 / 1000;
+    if (isHC(start.getHours() * 60 + start.getMinutes())) hc += kwh; else hp += kwh;
+  }
+  return { hp, hc };
+}
+
+// ---------- Conseils heures creuses
+// Règle 1 : un passage en confort peu après la fin des heures creuses → avancer la montée en température dans les heures creuses.
+// Règle 2 : une pièce en éco pendant les heures creuses de l'après-midi, qui repasse en confort en fin de journée → relance pendant les heures creuses.
+function recommendations(room) {
+  const hcs = parseHC(cfg.hc);
+  const recos = [];
+  if (!room.hasSchedule || !hcs.length) return recos;
+  for (const [hcStart, hcEnd] of hcs) {
+    // Règle 1 (heures creuses du matin seulement : on avance le réveil de la pièce)
+    const r1 = { room, kind: "early", hcEnd, days: [], from: null };
+    if (hcEnd < 11 * 60) {
+    room.week.forEach((pts, di) => {
+      const p = pts.find((x) => x.level === 1 && x.min > hcEnd && x.min <= hcEnd + 90);
+      if (p && !pts.some((x) => x.min >= hcEnd - 30 && x.min < p.min && x.level === 1)) { r1.days.push(di); r1.from = p.min; }
+    });
+    if (r1.days.length) {
+      r1.to = hcEnd - 30;
+      r1.title = `${room.name} : démarrer le confort à ${hhmm(r1.to)} au lieu de ${hhmm(r1.from)}`;
+      r1.text = `La montée en température est le moment qui consomme le plus. En la commençant avant ${hhmm(hcEnd)}, elle se fait au tarif heures creuses.`;
+      recos.push(r1);
+    }
+    }
+    // Règle 2 (créneau d'après-midi seulement)
+    if (hcStart >= 11 * 60 && hcEnd <= 18 * 60) {
+      const r2 = { room, kind: "boost", hcStart, hcEnd, days: [] };
+      room.week.forEach((pts, di) => {
+        const lvlIn = levelAt(room, di, hcStart + 30);
+        const next = pts.find((x) => x.level === 1 && x.min > hcEnd && x.min <= 19 * 60 + 30);
+        if (lvlIn !== 1 && next && !pts.some((x) => x.min >= hcStart && x.min < hcEnd)) { r2.days.push(di); r2.back = lvlIn; r2.next = next.min; }
+      });
+      if (r2.days.length) {
+        r2.title = `${room.name} : relance douce de ${hhmm(hcEnd - 60)} à ${hhmm(hcEnd)}`;
+        r2.text = `La pièce repasse en confort à ${hhmm(r2.next)}. Une heure de confort en heures creuses juste avant préchauffe les murs, la remontée du soir sera plus courte. À tester une semaine et à comparer.`;
+        recos.push(r2);
+      }
+    }
+  }
+  return recos;
+}
+function applyReco(r) {
+  const room = roomById(r.room.id);
+  const writes = [];
+  for (const di of r.days) {
+    let pts = room.week[di].map((p) => ({ ...p }));
+    if (r.kind === "early") {
+      const p = pts.find((x) => x.level === 1 && x.min === r.from);
+      if (p) p.min = r.to;
+    } else {
+      pts.push({ min: r.hcEnd - 60, level: 1 }, { min: r.hcEnd, level: r.back || 2 });
+    }
+    pts = pts.sort((a, b) => a.min - b.min).filter((p, i, a) => i === 0 || p.min !== a[i - 1].min);
+    if (pts.length > 10) continue;
+    writes.push(W(room, DAY_IDS[di], serializeDay(pts)));
+  }
+  if (writes.length) runJob(`${room.name} : conseil appliqué`, writes);
+}
+function recoCard(list) {
+  if (!list.length) return "";
+  return list.map((r, i) => `<div class="reco"><b>${esc(r.title)}</b><p class="help">${esc(r.text)} Jours concernés : ${r.days.map((d) => DAYS_SHORT[d]).join(", ")}.</p>
+    <button class="btn" data-reco="${i}">Appliquer au planning</button></div>`).join("");
+}
+
 // ---------- Commandes : envoi, nouvelles tentatives, puis vérification sur les radiateurs
 let jobSeq = 1;
 const SKIP_VERIFY = new Set([C.OVERRIDE_TOTAL, C.OVERRIDE_LEFT]);
@@ -362,7 +484,8 @@ function topView() {
   if (abs?.startDate && abs?.endDate && abs.endDate > nowS()) {
     banners += `<div class="banner info">${I.bag}<div class="b-body"><strong>Mode vacances</strong> jusqu'au ${dateFr(abs.endDate)}.<br><button class="btn" data-act="absence-stop">Arrêter le mode vacances</button></div></div>`;
   }
-  return `<header class="top"><div class="status"><h1>${esc(title)}</h1><p class="muted">${sub}</p></div>
+  const out = S.weather?.now != null ? `<br>Dehors à ${esc(cfg.place.name)} : ${deg(S.weather.now)}°` : "";
+  return `<header class="top"><div class="status"><h1>${esc(title)}</h1><p class="muted">${sub}${out}</p></div>
     <button class="iconbtn${S.loading ? " spin" : ""}" id="refresh" data-act="refresh" aria-label="Actualiser">${I.refresh}</button>
     <button class="iconbtn" data-act="settings" aria-label="Réglages">${I.gear}</button></header>${banners}`;
 }
@@ -386,6 +509,7 @@ function roomsView() {
     <button class="scene" data-act="vacation">${I.bag}Vacances</button></div>`;
   const tiles = rs.map((r) => {
     const chips = [];
+    if (r.temp == null) chips.push("Mesure ancienne");
     if (!r.on) chips.push("Éteint");
     else {
       chips.push(`Consigne ${deg(r.target)}°`);
@@ -396,7 +520,7 @@ function roomsView() {
     return `<button class="tile${r.on ? "" : " off"}" style="--heat:${heatPct(r.temp)}%" data-room="${r.id}" aria-label="${esc(r.name)}, ${r.temp != null ? deg(r.temp) + " degrés" : "température inconnue"}, ${r.on ? "allumé" : "éteint"}">
       ${pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>' : ""}
       <span class="name">${esc(r.name)}</span>
-      <span class="temp num">${r.temp != null ? deg(r.temp) : "–"}<sup>°</sup></span>
+      <span class="temp num">${r.temp != null ? deg(r.temp) + "<sup>°</sup>" : "–"}</span>
       <span class="meta">${chips.map((c) => c.startsWith("<span") ? c : `<span class="chip">${c}</span>`).join("")}</span></button>`;
   }).join("");
   return scenes + `<div class="rooms">${tiles}</div>`;
@@ -431,6 +555,7 @@ function planView() {
       <div class="legend">${[1, 2, 3].map((k) => `<span><i style="background:${LEVELS[k].color}"></i>${LEVELS[k].label}</span>`).join("")}</div>
     </div>
     <p class="help">Touche un jour pour changer ses horaires, ou une température en haut pour la régler.</p>
+    ${(() => { S.recos = recommendations(room); return S.recos.length ? `<div class="card"><h2 class="sec" style="margin-top:0">Conseils heures creuses</h2>${recoCard(S.recos)}</div>` : ""; })()}
     <button class="btn block" data-act="copy-plan">Copier ce planning vers une autre pièce</button>
     ${!room.prog ? `<p></p><button class="btn primary block" data-act="plan-enable">Activer le programme dans cette pièce</button>` : ""}`;
 }
@@ -442,8 +567,9 @@ function consoData() {
   for (const z of S.conso) {
     for (const p of z.consumptionPeriods || []) {
       const key = p.date;
-      const d = byDay.get(key) || { date: key, hp: 0, hc: 0, cost: 0 };
-      if (p.mode === 2) d.hc += p.consumedQuantity || 0; else d.hp += p.consumedQuantity || 0;
+      const d = byDay.get(key) || { date: key, hp: 0, hc: 0, cost: 0, hpCost: 0, hcCost: 0 };
+      if (p.mode === 2) { d.hc += p.consumedQuantity || 0; d.hcCost += p.cost || 0; }
+      else { d.hp += p.consumedQuantity || 0; d.hpCost += p.cost || 0; }
       d.cost += p.cost || 0;
       byDay.set(key, d);
       const r = byRoom.get(z.zoneLabel) || { name: z.zoneLabel, kwh: 0, cost: 0 };
@@ -474,7 +600,8 @@ function consoView() {
     const hcH = sc(x.hc), hpH = sc(x.hp);
     const base = H - padB;
     const lbl = new Date(x.date * 1000).toLocaleDateString("fr-FR", { weekday: "short", day: "numeric" });
-    const tip = `${lbl} : ${nf2.format(x.hp + x.hc)} kWh, ${nf2.format(x.cost)} €`;
+    const w = S.weather?.daily?.[dayKey(x.date)];
+    const tip = `${lbl} : ${nf2.format(x.hp + x.hc)} kWh, ${nf2.format(x.cost)} €${w ? `, dehors ${deg(w.mean)}° en moyenne` : ""}`;
     // creuses en bas, pleines au-dessus, 2 px d'écart, bout arrondi en haut uniquement
     const r = 4;
     const top = hpH > 0 ? hpH : hcH;
@@ -490,18 +617,67 @@ function consoView() {
   const roomsList = d.rooms.map((r) => `<div class="r"><span>${esc(r.name)}</span><span class="num"><b>${nf2.format(r.cost)} €</b> <span class="muted">${nf1.format(r.kwh)} kWh</span></span>
     <span class="share"><i style="width:${Math.round(r.kwh / Math.max(...d.rooms.map((x) => x.kwh)) * 100)}%"></i></span></div>`).join("");
   const missing = rooms().filter((r) => !d.rooms.find((x) => x.name === r.name)).map((r) => r.name);
-  const table = d.days.map((x) => `<tr><td>${new Date(x.date * 1000).toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short" })}</td><td>${nf2.format(x.hp)}</td><td>${nf2.format(x.hc)}</td><td>${nf2.format(x.cost)} €</td></tr>`).join("");
+  const table = d.days.map((x) => { const w = S.weather?.daily?.[dayKey(x.date)]; return `<tr><td>${new Date(x.date * 1000).toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short" })}</td><td>${nf2.format(x.hp)}</td><td>${nf2.format(x.hc)}</td><td>${nf2.format(x.cost)} €</td><td>${w ? deg(w.mean) + "°" : "–"}</td></tr>`; }).join("");
   return `<div class="card"><div class="kpis">
       <div class="kpi"><b class="num">${nf2.format(d.cost)} €</b><span>sur ${nb} jour${nb > 1 ? "s" : ""}</span></div>
       <div class="kpi"><b class="num">${nf1.format(d.kwh)} kWh</b><span>soit ${nf2.format(avg)} € par jour en moyenne</span></div></div></div>
     <div class="card"><h2 class="sec" style="margin-top:0">Par jour</h2>
       <div class="legend"><span><i style="background:var(--hp)"></i>Heures pleines</span><span><i style="background:var(--hc)"></i>Heures creuses</span></div>
       <div class="chart" id="chart"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Consommation par jour">${grid}${bars}</svg><div class="tip hidden" id="tip"></div></div>
-      <details><summary>Voir le tableau</summary><table class="data"><thead><tr><th>Jour</th><th>Pleines (kWh)</th><th>Creuses (kWh)</th><th>Coût</th></tr></thead><tbody>${table}</tbody></table></details>
+      <details><summary>Voir le tableau</summary><table class="data"><thead><tr><th>Jour</th><th>Pleines (kWh)</th><th>Creuses (kWh)</th><th>Coût</th><th>Dehors</th></tr></thead><tbody>${table}</tbody></table></details>
     </div>
     <div class="card"><h2 class="sec" style="margin-top:0">Par pièce</h2><div class="rlist">${roomsList}</div>
       ${missing.length ? `<p class="help">Rien de mesuré pour : ${esc(missing.join(", "))} (éteint sur la période).</p>` : ""}</div>
+    ${hcView(d)}
+    ${linkyView(d)}
     <p class="help">Coûts calculés par Cozytouch avec ton tarif. Les chiffres du jour arrivent souvent avec un jour de décalage.</p>`;
+}
+
+function hcView(d) {
+  const hp = d.days.reduce((s, x) => s + x.hp, 0), hc = d.days.reduce((s, x) => s + x.hc, 0);
+  const hpCost = d.days.reduce((s, x) => s + x.hpCost, 0), hcCost = d.days.reduce((s, x) => s + x.hcCost, 0);
+  const pHP = hp > 0.05 ? hpCost / hp : null, pHC = hc > 0.05 ? hcCost / hc : null;
+  const share = hp + hc > 0 ? Math.round(hp / (hp + hc) * 100) : null;
+  S.recos = rooms().flatMap(recommendations);
+  const price = pHP && pHC ? `Le kWh te coûte environ ${nf2.format(pHP)} € en heures pleines contre ${nf2.format(pHC)} € en heures creuses, soit ${Math.round((1 - pHC / pHP) * 100)} % de moins.` : "";
+  return `<div class="card"><h2 class="sec" style="margin-top:0">Heures creuses</h2>
+    <p class="help">Tes heures creuses : ${esc(hcText())}. ${price}</p>
+    ${share != null ? `<p><b class="num" style="font-size:28px">${share} %</b> <span class="muted">de la conso des radiateurs tombe en heures pleines.</span></p>` : ""}
+    ${S.recos.length ? recoCard(S.recos) : `<p class="help">Ta programmation profite déjà bien des heures creuses : pas de changement à proposer pour l'instant.</p>`}
+  </div>`;
+}
+
+function linkyView(d) {
+  if (S.linky == null && !S.linkyError) { loadLinky(); return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Lecture du compteur Linky…</p></div>`; }
+  if (S.linkyError) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Linky indisponible : ${esc(S.linkyError)}</p><button class="btn" data-act="linky-retry">Réessayer</button></div>`;
+  if (!S.linky.configured) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2>
+    <p class="help">${S.linky.demo ? "Le compteur Linky n'est pas lu en mode démo." : "Branche ton compteur Linky pour comparer la conso de toute la maison à celle des radiateurs : ajoute les secrets CHAUFFAGE_LINKY_TOKEN et CHAUFFAGE_LINKY_PRM dans Supabase (voir le guide)."}</p></div>`;
+  const L = S.linky;
+  const days = L.daily.slice(-14);
+  if (!days.length) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Pas encore de données Linky.</p></div>`;
+  const total = days.reduce((s, x) => s + x.kwh, 0);
+  // Part des radiateurs sur les jours communs
+  const rad = new Map(d.days.map((x) => [dayKey(x.date), x.hp + x.hc]));
+  const common = days.filter((x) => rad.has(x.date));
+  const radShare = common.length ? Math.round(common.reduce((s, x) => s + rad.get(x.date), 0) / Math.max(0.01, common.reduce((s, x) => s + x.kwh, 0)) * 100) : null;
+  const split = linkySplit(L.curve);
+  const hpShare = split.hp + split.hc > 0 ? Math.round(split.hp / (split.hp + split.hc) * 100) : null;
+  const max = Math.max(...days.map((x) => x.kwh), 0.1);
+  const W_ = 320, H = 120, padB = 20, gap = 4, bw = (W_ - gap * (days.length - 1)) / days.length;
+  const bars = days.map((x, i) => {
+    const h = x.kwh / max * (H - padB - 6), X = i * (bw + gap), y = H - padB - h, r = Math.min(4, bw / 2);
+    const lbl = new Date(x.date + "T12:00").toLocaleDateString("fr-FR", { weekday: "short", day: "numeric" });
+    const w = S.weather?.daily?.[x.date];
+    const tip = `${lbl} : ${nf1.format(x.kwh)} kWh${rad.has(x.date) ? `, dont ${nf1.format(rad.get(x.date))} kWh de radiateurs` : ""}${w ? `, dehors ${deg(w.mean)}°` : ""}`;
+    return `<g class="b" data-tip="${esc(tip)}" data-x="${X + bw / 2}" data-y="${y}"><path d="M${X},${H - padB} v${-(h - r)} q0,-${r} ${r},-${r} h${bw - 2 * r} q${r},0 ${r},${r} v${h - r} z" fill="var(--hc)"/>
+      <rect x="${X}" y="0" width="${bw + gap}" height="${H}" fill="transparent"/>${i % 2 === days.length % 2 ? "" : `<text x="${X + bw / 2}" y="${H - 5}" text-anchor="middle" font-size="9" fill="var(--ink-2)">${new Date(x.date + "T12:00").getDate()}</text>`}</g>`;
+  }).join("");
+  return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2>
+    <div class="kpis"><div class="kpi"><b class="num">${nf1.format(total)} kWh</b><span>sur ${days.length} jours (Linky)</span></div>
+    ${radShare != null ? `<div class="kpi"><b class="num">${radShare} %</b><span>pour les radiateurs Cozytouch</span></div>` : hpShare != null ? `<div class="kpi"><b class="num">${hpShare} %</b><span>en heures pleines (7 derniers jours)</span></div>` : ""}</div>
+    ${radShare != null && hpShare != null ? `<p class="help">Sur les 7 derniers jours, ${hpShare} % de la conso de la maison tombe en heures pleines.</p>` : ""}
+    <div class="chart" id="chart2"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Consommation de la maison par jour"><line x1="0" x2="${W_}" y1="${H - padB}" y2="${H - padB}" stroke="var(--line)"/>${bars}</svg><div class="tip hidden" id="tip2"></div></div>
+    <p class="help">Données Enedis, mises à jour une fois par jour (la veille).</p></div>`;
 }
 
 // ---------- Feuilles (fenêtres du bas)
@@ -538,7 +714,7 @@ function openRoom(id) {
     const t = pendingTarget ?? r.target;
     const nx = r.prog && !r.override ? nextChange(r) : null;
     return `<h3>${esc(r.name)}</h3><p class="muted" style="margin:0">${esc(r.model)}${r.watts ? `, ${r.watts} W` : ""}</p>
-      <div class="big-temp"><span class="now">${r.temp != null ? deg(r.temp) + "°" : "–"}</span><span class="muted">dans la pièce<br>${r.tempAt ? "mesuré " + ago(nowS() - r.tempAt) : ""}</span></div>
+      <div class="big-temp"><span class="now">${r.temp != null ? deg(r.temp) + "°" : "–"}</span><span class="muted">${r.temp != null ? `dans la pièce<br>mesuré ${ago(nowS() - r.tempAt)}` : r.lastTemp != null && r.tempAt ? `pas de mesure récente<br>dernière : ${deg(r.lastTemp)}° ${ago(nowS() - r.tempAt)}` : "température inconnue"}</span></div>
       <div class="switch"><span>${r.on ? "Allumé" : "Éteint"}</span><button class="toggle" role="switch" aria-checked="${r.on}" aria-label="Allumer ou éteindre" data-r="power"></button></div>
       ${r.on ? `
       <div class="stepper"><button data-r="minus" aria-label="Baisser la consigne">−</button>
@@ -710,6 +886,9 @@ function openSettings() {
     <h2 class="sec">Coup de chaud</h2>
     <div class="row"><label class="field"><span>Degrés en plus</span><input id="s-bdelta" type="number" step="0.5" min="0.5" max="5" value="${cfg.boost.delta}"></label>
       <label class="field"><span>Durée (min)</span><input id="s-bmin" type="number" step="15" min="15" max="240" value="${cfg.boost.minutes}"></label></div>
+    <h2 class="sec">Tarif et météo</h2>
+    <label class="field"><span>Heures creuses</span><input id="s-hc" type="text" value="${esc(cfg.hc)}" placeholder="01:04-07:04, 14:04-16:04"></label>
+    <label class="field"><span>Commune (pour la météo)</span><input id="s-place" type="text" value="${esc(cfg.place.name)}"></label>
     <label class="field"><span>Alerte si plus de nouvelles des radiateurs depuis (heures)</span><input id="s-stale" type="number" min="1" max="24" value="${cfg.staleHours}"></label>
     <button class="btn primary block" data-save>Enregistrer</button>`, (el) => {
     const tog = (id) => el.querySelector(id)?.addEventListener("click", (e) => { const b = e.currentTarget; b.setAttribute("aria-checked", b.getAttribute("aria-checked") !== "true"); });
@@ -723,6 +902,16 @@ function openSettings() {
       cfg.work = { room: el.querySelector("#s-wroom").value || cfg.work.room, temp: +el.querySelector("#s-wtemp").value || 20, hours: +el.querySelector("#s-whours").value || 8 };
       cfg.boost = { delta: +el.querySelector("#s-bdelta").value || 2, minutes: +el.querySelector("#s-bmin").value || 60 };
       cfg.staleHours = +el.querySelector("#s-stale").value || 3;
+      cfg.hc = el.querySelector("#s-hc").value.trim() || cfg.hc;
+      const place = el.querySelector("#s-place").value.trim();
+      if (place && place !== cfg.place.name) {
+        fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=fr&countryCode=FR`)
+          .then((r) => r.json()).then((g) => {
+            const x = g.results?.[0];
+            if (x) { cfg.place = { name: x.name, lat: x.latitude, lon: x.longitude }; store.set("cfg", cfg); store.del("weather"); loadWeather(); }
+            else toast("Commune introuvable");
+          }).catch(() => {});
+      }
       store.set("cfg", cfg);
       closeSheet();
       if (wasDemo !== cfg.demo) { S.setup = null; S.conso = null; S.fetchedAt = 0; store.del("lastState"); }
@@ -745,7 +934,7 @@ function bindWelcome() {
   $("#w-go").onclick = async () => {
     cfg.url = $("#w-url").value.trim(); cfg.code = $("#w-code").value; cfg.demo = false;
     $("#w-err").textContent = "Connexion…";
-    try { await api("state"); store.set("cfg", cfg); render(); refresh(); }
+    try { await api("state"); store.set("cfg", cfg); render(); refresh(); loadWeather(); }
     catch (e) { $("#w-err").textContent = e.message; cfg.url = ""; }
   };
   if ($("#w-demo")) $("#w-demo").onclick = () => { cfg.demo = true; store.set("cfg", cfg); render(); refresh(); };
@@ -756,7 +945,7 @@ function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0
 
 document.addEventListener("click", (e) => {
   if (sheetEl && sheetEl.contains(e.target)) return;
-  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss]");
+  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco]");
   if (!t) return;
   if (t.dataset.tab) return setTab(t.dataset.tab);
   if (t.dataset.room) return openRoom(+t.dataset.room);
@@ -765,11 +954,13 @@ document.addEventListener("click", (e) => {
   if (t.dataset.level) return openLevel(S.planRoom, +t.dataset.level);
   if (t.dataset.retry) return retryJob(+t.dataset.retry);
   if (t.dataset.dismiss) return dismissJob(+t.dataset.dismiss);
+  if (t.dataset.reco) { const r = S.recos?.[+t.dataset.reco]; if (r && confirm(`${r.title} ?`)) applyReco(r); return; }
   const a = t.dataset.act;
   const rs = rooms();
   if (a === "refresh") refresh();
   if (a === "settings") openSettings();
   if (a === "conso-retry") { S.consoError = null; S.conso = null; render(); }
+  if (a === "linky-retry") { S.linkyError = null; S.linky = null; loadLinky(true); render(); }
   if (a === "all-on") {
     const writes = rs.flatMap((r) => [...(!r.on ? writesPower(r, true) : []), ...(!r.prog ? [W(r, C.PROG, "1")] : [])]);
     if (!writes.length) return toast("Tout est déjà allumé en programme");
@@ -792,9 +983,11 @@ document.addEventListener("click", (e) => {
 
 // Infobulle du graphique (toucher ou survol)
 function chartTip(e) {
-  const g = e.target.closest?.("g.b"); const tip = $("#tip"); const ch = $("#chart");
-  if (!tip || !ch) return;
-  if (!g) { tip.classList.add("hidden"); return; }
+  const g = e.target.closest?.("g.b");
+  document.querySelectorAll(".chart .tip").forEach((t) => t.classList.add("hidden"));
+  if (!g) return;
+  const ch = g.closest(".chart"); const tip = ch?.querySelector(".tip");
+  if (!tip) return;
   const svg = ch.querySelector("svg"); const k = svg.getBoundingClientRect().width / 320;
   tip.textContent = g.dataset.tip; tip.classList.remove("hidden");
   tip.style.left = (+g.dataset.x * k) + "px"; tip.style.top = Math.max(20, +g.dataset.y * k) + "px";
@@ -814,7 +1007,7 @@ render = function () { _render(); if (roomSheetRedraw && sheetEl && sheetEl.data
 // ---------- Démarrage
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 render();
-if (cfg.demo || cfg.url) refresh();
+if (cfg.demo || cfg.url) { refresh(); loadWeather(); }
 setInterval(() => { if (document.visibilityState === "visible" && (cfg.demo || cfg.url) && !S.jobs.some((j) => j.status === "verifying")) refresh({ quiet: true }); }, 60000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && (cfg.demo || cfg.url)) refresh({ quiet: true }); });
 })();
