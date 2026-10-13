@@ -18,6 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
+const APP_VERSION = "4.2 (défauts)";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -50,7 +51,7 @@ const store = {
 };
 
 const DEFAULT_CFG = { url: "", code: "", demo: false, staleHours: 3,
-  work: { room: "Bureau", temp: 20, hours: 8 }, boost: { delta: 2, minutes: 60 },
+  work: { room: "Bureau", temp: 20, until: "18:00", base: 17 }, boost: { delta: 2, minutes: 60 },
   hc: "01:04-07:04, 14:04-16:04",
   place: { name: "Rezé", lat: 47.1797, lon: -1.5494 } };
 let cfg = Object.assign({}, DEFAULT_CFG, store.get("cfg", {}));
@@ -126,7 +127,8 @@ function rooms() {
       model: rad ? rad.longName : "",
       watts: rc[C.POWER_W] ? num(rc[C.POWER_W].value) : null,
       // Température masquée si la dernière mesure est trop ancienne
-      lastTemp: tempOk ? num(v(C.TEMP)) : null,
+      // 0° (ou une valeur absurde) = le radiateur n'envoie pas de mesure, pas une vraie température
+      lastTemp: tempOk && num(v(C.TEMP)) > 0.5 && num(v(C.TEMP)) < 45 ? num(v(C.TEMP)) : null,
       tempAt: c[C.TEMP]?.modificationDate || 0,
       get temp() { return this.tempAt && nowS() - this.tempAt < cfg.staleHours * 3600 ? this.lastTemp : null; },
       target: num(v(C.TARGET)),
@@ -241,6 +243,7 @@ async function refresh({ quiet = false } = {}) {
   try {
     const d = await api("state");
     S.setup = d.setup; S.serverNow = d.now; S.fetchedAt = Date.now(); S.error = null; S.fromCache = false;
+    loadFaults();
     if (!cfg.demo) store.set("lastState", { setup: d.setup, now: d.now, fetchedAt: S.fetchedAt });
   } catch (e) {
     S.error = e.message;
@@ -253,6 +256,36 @@ async function loadConso() {
   try { const d = await api("conso"); S.conso = d.conso; S.consoError = null; }
   catch (e) { S.consoError = e.message; }
   if (S.tab === "conso") render();
+}
+
+// ---------- Défauts signalés par les radiateurs
+let faultsAt = 0;
+async function loadFaults(force = false) {
+  if (!force && Date.now() - faultsAt < 30 * 60000) return;
+  faultsAt = Date.now();
+  if (cfg.demo) {
+    // En démo : lecture directe des codes, sans libellé
+    const out = [];
+    for (const d of S.setup?.devices || []) {
+      const c = capsOf(d);
+      for (const id of [150, 290, 303]) {
+        try {
+          for (const row of JSON.parse(c[id]?.value || "[]")) if (row.some((x) => x) && !row.includes(255) && !out.some((o) => o.deviceId === d.deviceId && o.code === row.slice(0, 4).join(".")))
+            out.push({ deviceId: d.deviceId, name: c[C.NAME]?.value || d.longName || d.name, code: row.slice(0, 4).join("."), since: c[id].modificationDate });
+        } catch { /* rien */ }
+      }
+    }
+    S.faults = out; render(); return;
+  }
+  try { const d = await api("faults"); S.faults = d.faults || []; render(); }
+  catch { faultsAt = 0; /* relais pas encore à jour : on réessaiera */ }
+}
+// La CozyBox recopie souvent le défaut d'un radiateur : on n'affiche qu'une fois chaque code
+function faultsList() {
+  const seen = new Set();
+  const list = [...(S.faults || [])].sort((a, b) => (rooms().some((r) => r.id === b.deviceId) ? 1 : 0) - (rooms().some((r) => r.id === a.deviceId) ? 1 : 0));
+  return list.filter((f) => { const k = f.code; if (seen.has(k)) return false; seen.add(k); return true; })
+    .map((f) => ({ ...f, room: rooms().find((r) => r.id === f.deviceId) }));
 }
 
 // ---------- Heures creuses
@@ -462,6 +495,7 @@ function writesOverride(room, t, minutes) {
   w.push(W(room, C.OVERRIDE_TOTAL, minutes), W(room, C.OVERRIDE, "1"), W(room, C.TARGET, t));
   return w;
 }
+function workActive(r) { return r && r.on && r.override && Math.abs((r.target ?? 0) - cfg.work.temp) < 0.01; }
 function writesCancelOverride(room) { return [W(room, C.OVERRIDE, "0")]; }
 const clampT = (room, t) => Math.min(room.max, Math.max(room.min, Math.round(t / room.step) * room.step));
 
@@ -495,6 +529,11 @@ function topView() {
   if (S.setup && h.stale && S.tab === "rooms") {
     banners += `<div class="banner alert">${I.warn}<div class="b-body"><strong>Tes radiateurs ne donnent plus de nouvelles</strong> depuis ${dateFr(h.last)}. Les commandes risquent de ne pas passer. Débranche la CozyBox 30 secondes puis rebranche-la.</div></div>`;
   }
+  if (S.tab === "rooms") for (const f of faultsList()) {
+    banners += `<div class="banner alert">${I.warn}<div class="b-body"><strong>${esc(f.room?.name || f.name)} : défaut ${esc(f.code)}</strong>${f.since ? ` depuis le ${new Date(f.since * 1000).toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}` : ""}.
+      ${f.label ? `<br>${esc(f.label)}` : ""}${f.cause ? `<br><span class="muted">Cause probable : ${esc(f.cause)}</span>` : ""}${f.repair ? `<br><span class="muted">Que faire : ${esc(f.repair)}</span>` : ""}
+      ${!f.label ? `<br><span class="muted">Coupe le radiateur au disjoncteur une minute puis rallume-le. Si le défaut revient, signale ce code au service client Atlantic.</span>` : ""}</div></div>`;
+  }
   const abs = S.setup?.absence;
   if (abs?.startDate && abs?.endDate && abs.endDate > nowS()) {
     banners += `<div class="banner info">${I.bag}<div class="b-body"><strong>Mode vacances</strong> jusqu'au ${dateFr(abs.endDate)}.<br><button class="btn" data-act="absence-stop">Arrêter le mode vacances</button></div></div>`;
@@ -520,11 +559,13 @@ function roomsView() {
   const scenes = `<div class="scenes${work ? "" : " three"}" role="group" aria-label="Scènes">
     <button class="scene" data-act="all-on">${I.power}<span>Tout allumer</span></button>
     <button class="scene" data-act="all-off">${I.moon}<span>Tout éteindre</span></button>
-    ${work ? `<button class="scene" data-act="work">${I.laptop}<span>Télétravail</span></button>` : ""}
+    ${work ? `<button class="scene${workActive(work) ? " on" : ""}" data-act="work" aria-pressed="${workActive(work)}">${I.laptop}<span>${workActive(work) ? "Télétravail en cours" : "Télétravail"}</span></button>` : ""}
     <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button></div>`;
   const tiles = rs.map((r) => {
     const mode = !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
+    const hasFault = (S.faults || []).some((f) => f.deviceId === r.id);
     const badge = pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>'
+      : hasFault ? `<span class="badge fault" title="Défaut signalé">${I.warn}</span>`
       : !r.on ? `<span class="badge">${I.power}</span>` : r.heating ? `<span class="badge hot" title="Chauffe">${I.flame}</span>` : "";
     return `<button class="tile${r.on ? "" : " off"}" style="--heat:${heatPct(r.temp)}%" data-room="${r.id}" aria-label="${esc(r.name)}, ${r.temp != null ? deg(r.temp) + " degrés" : "température inconnue"}, ${r.on ? "allumé" : "éteint"}">
       <span class="t-top"><span class="name">${esc(r.name)}</span>${badge}</span>
@@ -692,7 +733,7 @@ function linkyView(d) {
 // ---------- Optimiser : programme proposé à partir des habitudes
 const USAGES = {
   bedroom: { label: "Chambre", t: { 1: 18, 2: 16, 3: 17 } },
-  office: { label: "Bureau", t: { 1: 19, 2: 16, 3: 16 } },
+  office: { label: "Bureau (chauffé à la demande avec le bouton Télétravail)", t: { 1: 20, 2: 17, 3: 17 } },
   living: { label: "Pièce de vie", t: { 1: 19, 2: 16, 3: 17 } },
   bath: { label: "Salle de bain", t: { 1: 22, 2: 17, 3: 17 } },
   guest: { label: "Chambre d'amis (rarement occupée)", t: { 1: 18, 2: 16, 3: 16 } },
@@ -724,8 +765,9 @@ function proposal(room) {
   const u = usageOf(room);
   if (u === "skip" || !USAGES[u].t) return null;
   const t = { ...USAGES[u].t };
-  if (habits.feel === "frileux") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
-  if (habits.feel === "frais") t[1] = Math.max(17, t[1] - 1);
+  if (u === "office") { t[1] = cfg.work.temp; t[2] = t[3] = cfg.work.base ?? 17; }
+  if (habits.feel === "frileux" && u !== "office") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
+  if (habits.feel === "frais" && u !== "office") t[1] = Math.max(17, t[1] - 1);
   const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
   const week = [];
   for (let d = 0; d < 7; d++) {
@@ -738,7 +780,7 @@ function proposal(room) {
     let p = [];
     if (u === "bedroom") p = [{ min: wake - 30, level: 1 }, { min: wake + 30, level: 2 }, { min: bed - 60, level: 1 }, { min: bed, level: 3 }];
     if (u === "bath") p = [{ min: wake - 30, level: 1 }, { min: wake + 45, level: 2 }, { min: bed - 90, level: 1 }, { min: bed - 30, level: 3 }];
-    if (u === "office") p = home ? [{ min: wake, level: 1 }, { min: Math.max(wake + 60, 19 * 60), level: 2 }, { min: bed, level: 3 }] : [{ min: wake, level: 2 }, { min: bed, level: 3 }];
+    if (u === "office") p = [{ min: 0, level: 2 }];
     if (u === "living") p = home ? [{ min: wake - 30, level: 1 }, { min: bed, level: 3 }]
       : [{ min: wake - 30, level: 1 }, { min: leave, level: 2 }, { min: back - 45, level: 1 }, { min: bed, level: 3 }];
     if (u === "guest") p = [{ min: 0, level: 2 }];
@@ -884,7 +926,7 @@ function openRoom(id) {
     const t = pendingTarget ?? r.target;
     const nx = r.prog && !r.override ? nextChange(r) : null;
     return `<h3>${esc(r.name)}</h3><p class="muted" style="margin:0">${esc(r.model)}${r.watts ? `, ${r.watts} W` : ""}</p>
-      <div class="big-temp"><span class="now">${r.temp != null ? deg(r.temp) + "°" : "–"}</span><span class="muted">${r.temp != null ? `dans la pièce<br>mesuré ${ago(nowS() - r.tempAt)}` : r.lastTemp != null && r.tempAt ? `pas de mesure récente<br>dernière : ${deg(r.lastTemp)}° ${ago(nowS() - r.tempAt)}` : "température inconnue"}</span></div>
+      <div class="big-temp"><span class="now">${r.temp != null ? deg(r.temp) + "°" : "–"}</span><span class="muted">${r.temp != null ? `dans la pièce<br>mesuré ${ago(nowS() - r.tempAt)}` : r.lastTemp != null && r.tempAt ? `pas de mesure récente<br>dernière : ${deg(r.lastTemp)}° ${ago(nowS() - r.tempAt)}` : "le radiateur n'envoie pas<br>sa température en ce moment"}</span></div>
       <div class="switch"><span>${r.on ? "Allumé" : "Éteint"}</span><button class="toggle" role="switch" aria-checked="${r.on}" aria-label="Allumer ou éteindre" data-r="power"></button></div>
       ${r.on ? `
       <div class="stepper"><button data-r="minus" aria-label="Baisser la consigne">−</button>
@@ -1052,7 +1094,8 @@ function openSettings() {
     <h2 class="sec">Télétravail</h2>
     <div class="row"><label class="field"><span>Pièce</span><select id="s-wroom">${rooms().map((r) => `<option ${r.name === cfg.work.room ? "selected" : ""}>${esc(r.name)}</option>`).join("")}</select></label>
       <label class="field"><span>Température</span><input id="s-wtemp" type="number" step="0.5" min="12" max="26" value="${cfg.work.temp}"></label>
-      <label class="field"><span>Heures</span><input id="s-whours" type="number" min="1" max="12" value="${cfg.work.hours}"></label></div>
+      <label class="field"><span>Jusqu'à</span><input id="s-wuntil" type="time" step="900" value="${esc(cfg.work.until || "18:00")}"></label></div>
+    <label class="field"><span>Température du bureau le reste du temps</span><input id="s-wbase" type="number" step="0.5" min="7" max="20" value="${cfg.work.base ?? 17}"></label>
     <h2 class="sec">Coup de chaud</h2>
     <div class="row"><label class="field"><span>Degrés en plus</span><input id="s-bdelta" type="number" step="0.5" min="0.5" max="5" value="${cfg.boost.delta}"></label>
       <label class="field"><span>Durée (min)</span><input id="s-bmin" type="number" step="15" min="15" max="240" value="${cfg.boost.minutes}"></label></div>
@@ -1060,7 +1103,8 @@ function openSettings() {
     <label class="field"><span>Heures creuses</span><input id="s-hc" type="text" value="${esc(cfg.hc)}" placeholder="01:04-07:04, 14:04-16:04"></label>
     <label class="field"><span>Commune (pour la météo)</span><input id="s-place" type="text" value="${esc(cfg.place.name)}"></label>
     <label class="field"><span>Alerte si plus de nouvelles des radiateurs depuis (heures)</span><input id="s-stale" type="number" min="1" max="24" value="${cfg.staleHours}"></label>
-    <button class="btn primary block" data-save>Enregistrer</button>`, (el) => {
+    <button class="btn primary block" data-save>Enregistrer</button>
+    <p class="help" style="text-align:center">Version ${APP_VERSION}</p>`, (el) => {
     const tog = (id) => el.querySelector(id)?.addEventListener("click", (e) => { const b = e.currentTarget; b.setAttribute("aria-checked", b.getAttribute("aria-checked") !== "true"); });
     tog("#s-demo"); tog("#s-stuck");
     el.querySelector("[data-save]").onclick = () => {
@@ -1069,7 +1113,8 @@ function openSettings() {
       cfg.code = el.querySelector("#s-code").value;
       cfg.demo = el.querySelector("#s-demo").getAttribute("aria-checked") === "true";
       if (el.querySelector("#s-stuck")) cfg.demoStuck = el.querySelector("#s-stuck").getAttribute("aria-checked") === "true";
-      cfg.work = { room: el.querySelector("#s-wroom").value || cfg.work.room, temp: +el.querySelector("#s-wtemp").value || 20, hours: +el.querySelector("#s-whours").value || 8 };
+      cfg.work = { room: el.querySelector("#s-wroom").value || cfg.work.room, temp: +el.querySelector("#s-wtemp").value || 20,
+        until: el.querySelector("#s-wuntil").value || "18:00", base: +el.querySelector("#s-wbase").value || 17 };
       cfg.boost = { delta: +el.querySelector("#s-bdelta").value || 2, minutes: +el.querySelector("#s-bmin").value || 60 };
       cfg.staleHours = +el.querySelector("#s-stale").value || 3;
       cfg.hc = el.querySelector("#s-hc").value.trim() || cfg.hc;
@@ -1151,7 +1196,18 @@ document.addEventListener("click", (e) => {
   }
   if (a === "work") {
     const r = rs.find((x) => x.name.toLowerCase() === String(cfg.work.room).toLowerCase());
-    if (r) runJob(`Télétravail : ${r.name} à ${deg(cfg.work.temp)}° pendant ${cfg.work.hours} h`, writesOverride(r, clampT(r, cfg.work.temp), cfg.work.hours * 60));
+    if (!r) return;
+    if (workActive(r)) {
+      if (confirm(`Arrêter le télétravail ? ${r.name} repasse à sa température habituelle.`)) runJob(`Fin du télétravail : ${r.name}`, writesCancelOverride(r));
+      return;
+    }
+    const { min } = nowParts();
+    const end = toMin(cfg.work.until || "18:00");
+    if (end - min < 30) return toast(`Il est déjà presque ${cfg.work.until} : rien à lancer`);
+    // La dérogation Cozytouch se règle à l'heure : on arrondit à l'heure la plus proche, entre 1 et 12 h
+    const minutes = Math.min(12 * 60, Math.max(60, Math.round((end - min) / 60) * 60));
+    const endAt = new Date(Date.now() + minutes * 60000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+    runJob(`Télétravail : ${r.name} à ${deg(cfg.work.temp)}° jusqu'à ${endAt}`, writesOverride(r, clampT(r, cfg.work.temp), minutes));
   }
   if (a === "vacation") openVacation();
   if (a === "absence-stop") absenceJob("Fin du mode vacances", null, null);
