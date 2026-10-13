@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "4.2 (défauts)";
+const APP_VERSION = "4.3";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -600,6 +600,7 @@ function planView() {
   return `<div class="chips" role="group" aria-label="Pièce">${chips}</div>
     <div class="levels">${levels}</div>
     <p class="help">${room.prog ? "Le programme est actif dans cette pièce." : "Cette pièce est en manuel : le programme ne s'applique pas."} ${nxTxt}</p>
+    ${room.week.some((d) => !d.length) ? `<div class="banner alert">${I.warn}<div class="b-body"><strong>Journées vides : ${room.week.map((d, k) => d.length ? null : DAYS_SHORT[k]).filter(Boolean).join(", ")}.</strong> Le radiateur n'a aucun horaire ces jours-là. Va dans Optimiser et applique à nouveau le programme de cette pièce, ou touche le jour pour lui donner des horaires.</div></div>` : ""}
     <div class="card"><div class="week">${rows}</div>
       <div class="hours" aria-hidden="true"><span></span><div><span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>24 h</span></div></div>
       <div class="legend">${[1, 2, 3].map((k) => `<span><i style="background:${LEVELS[k].color}"></i>${LEVELS[k].label}</span>`).join("")}</div>
@@ -780,12 +781,14 @@ function proposal(room) {
     let p = [];
     if (u === "bedroom") p = [{ min: wake - 30, level: 1 }, { min: wake + 30, level: 2 }, { min: bed - 60, level: 1 }, { min: bed, level: 3 }];
     if (u === "bath") p = [{ min: wake - 30, level: 1 }, { min: wake + 45, level: 2 }, { min: bed - 90, level: 1 }, { min: bed - 30, level: 3 }];
-    if (u === "office") p = [{ min: 0, level: 2 }];
+    if (u === "office") p = null;
     if (u === "living") p = home ? [{ min: wake - 30, level: 1 }, { min: bed, level: 3 }]
       : [{ min: wake - 30, level: 1 }, { min: leave, level: 2 }, { min: back - 45, level: 1 }, { min: bed, level: 3 }];
-    if (u === "guest") p = [{ min: 0, level: 2 }];
+    if (u === "guest") p = null;
     // Heures creuses du matin : la montée en confort démarre avant la fin du tarif réduit si le réveil est juste après
-    for (const e of morningHC) for (const x of p) if (x.level === 1 && x.min > e && x.min <= e + 90) x.min = e - 30;
+    if (p) for (const e of morningHC) for (const x of p) if (x.level === 1 && x.min > e && x.min <= e + 90) x.min = e - 30;
+    // Niveau constant : deux points (01:00 et 23:00). Un point unique à 00:00 est mal accepté par certains radiateurs
+    if (!p) { week.push([{ min: 60, level: 2 }, { min: 1380, level: 2 }]); continue; }
     week.push(cleanPoints(p));
   }
   return { usage: u, t, week };
