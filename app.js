@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "4.3";
+const APP_VERSION = "4.4";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -50,7 +50,7 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch { /* rien */ } },
 };
 
-const DEFAULT_CFG = { url: "", code: "", demo: false, staleHours: 3,
+const DEFAULT_CFG = { url: "", code: "", demo: false, staleHours: 24,
   work: { room: "Bureau", temp: 20, until: "18:00", base: 17 }, boost: { delta: 2, minutes: 60 },
   hc: "01:04-07:04, 14:04-16:04",
   place: { name: "Rezé", lat: 47.1797, lon: -1.5494 } };
@@ -58,6 +58,7 @@ let cfg = Object.assign({}, DEFAULT_CFG, store.get("cfg", {}));
 cfg.work = Object.assign({}, DEFAULT_CFG.work, cfg.work);
 cfg.boost = Object.assign({}, DEFAULT_CFG.boost, cfg.boost);
 cfg.place = Object.assign({}, DEFAULT_CFG.place, cfg.place);
+if (!cfg.staleHours || cfg.staleHours === 3) cfg.staleHours = 24; // les radiateurs au repos envoient rarement leur température
 
 const S = {
   setup: null, conso: null, serverNow: 0, fetchedAt: 0, loading: false, error: null,
@@ -571,7 +572,7 @@ function roomsView() {
       <span class="t-top"><span class="name">${esc(r.name)}</span>${badge}</span>
       <span class="temp num">${r.temp != null ? deg(r.temp) + "<sup>°</sup>" : `<span class="nodata">–</span>`}</span>
       <span class="t-foot">${r.on ? `<span class="target num">${I.target}${deg(r.target)}°</span>` : ""}<span class="mode">${esc(mode)}</span></span>
-      ${r.temp == null ? `<span class="stale">Mesure ancienne</span>` : ""}</button>`;
+      ${r.temp == null ? `<span class="stale">Mesure ancienne</span>` : nowS() - r.tempAt > 2 * 3600 ? `<span class="stale">Mesuré ${ago(nowS() - r.tempAt)}</span>` : ""}</button>`;
   }).join("");
   return scenes + `<div class="rooms">${tiles}</div>`;
 }
@@ -1105,7 +1106,8 @@ function openSettings() {
     <h2 class="sec">Tarif et météo</h2>
     <label class="field"><span>Heures creuses</span><input id="s-hc" type="text" value="${esc(cfg.hc)}" placeholder="01:04-07:04, 14:04-16:04"></label>
     <label class="field"><span>Commune (pour la météo)</span><input id="s-place" type="text" value="${esc(cfg.place.name)}"></label>
-    <label class="field"><span>Alerte si plus de nouvelles des radiateurs depuis (heures)</span><input id="s-stale" type="number" min="1" max="24" value="${cfg.staleHours}"></label>
+    <label class="field"><span>Alerte si plus de nouvelles des radiateurs depuis (heures)</span><input id="s-stale" type="number" min="1" max="72" value="${cfg.staleHours}"></label>
+    <p class="help">Un radiateur au repos n'envoie sa température que lorsqu'elle change : quelques heures sans mesure sont normales.</p>
     <button class="btn primary block" data-save>Enregistrer</button>
     <p class="help" style="text-align:center">Version ${APP_VERSION}</p>`, (el) => {
     const tog = (id) => el.querySelector(id)?.addEventListener("click", (e) => { const b = e.currentTarget; b.setAttribute("aria-checked", b.getAttribute("aria-checked") !== "true"); });
@@ -1119,7 +1121,7 @@ function openSettings() {
       cfg.work = { room: el.querySelector("#s-wroom").value || cfg.work.room, temp: +el.querySelector("#s-wtemp").value || 20,
         until: el.querySelector("#s-wuntil").value || "18:00", base: +el.querySelector("#s-wbase").value || 17 };
       cfg.boost = { delta: +el.querySelector("#s-bdelta").value || 2, minutes: +el.querySelector("#s-bmin").value || 60 };
-      cfg.staleHours = +el.querySelector("#s-stale").value || 3;
+      cfg.staleHours = Math.max(6, +el.querySelector("#s-stale").value || 24);
       cfg.hc = el.querySelector("#s-hc").value.trim() || cfg.hc;
       const place = el.querySelector("#s-place").value.trim();
       if (place && place !== cfg.place.name) {
