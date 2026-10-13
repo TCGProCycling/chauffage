@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "4.4";
+const APP_VERSION = "4.5";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -411,7 +411,11 @@ let jobSeq = 1;
 const SKIP_VERIFY = new Set([C.OVERRIDE_TOTAL, C.OVERRIDE_LEFT]);
 function sameValue(cap, a, b) {
   if (a == null) return false;
-  if (DAY_IDS.includes(cap) || [C.COMFORT_T, C.ECO_T, C.NIGHT_T].includes(cap)) {
+  if (DAY_IDS.includes(cap)) {
+    const norm = (v) => { const pts = parseDay(v); return JSON.stringify(pts.filter((p, i) => i === 0 || p.level !== pts[i - 1].level)); };
+    try { return norm(a) === norm(b); } catch { return a === b; }
+  }
+  if ([C.COMFORT_T, C.ECO_T, C.NIGHT_T].includes(cap)) {
     try { return JSON.stringify(JSON.parse(a)) === JSON.stringify(JSON.parse(b)); } catch { return a === b; }
   }
   const x = parseFloat(a), y = parseFloat(b);
@@ -768,6 +772,7 @@ function proposal(room) {
   if (u === "skip" || !USAGES[u].t) return null;
   const t = { ...USAGES[u].t };
   if (u === "office") { t[1] = cfg.work.temp; t[2] = t[3] = cfg.work.base ?? 17; }
+  if (u === "guest") t[3] = t[2]; // nuit = éco : la pièce reste à température constante
   if (habits.feel === "frileux" && u !== "office") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
   if (habits.feel === "frais" && u !== "office") t[1] = Math.max(17, t[1] - 1);
   const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
@@ -789,7 +794,7 @@ function proposal(room) {
     // Heures creuses du matin : la montée en confort démarre avant la fin du tarif réduit si le réveil est juste après
     if (p) for (const e of morningHC) for (const x of p) if (x.level === 1 && x.min > e && x.min <= e + 90) x.min = e - 30;
     // Niveau constant : deux points (01:00 et 23:00). Un point unique à 00:00 est mal accepté par certains radiateurs
-    if (!p) { week.push([{ min: 60, level: 2 }, { min: 1380, level: 2 }]); continue; }
+    if (!p) { week.push([{ min: 420, level: 2 }, { min: 1380, level: 3 }]); continue; }
     week.push(cleanPoints(p));
   }
   return { usage: u, t, week };
