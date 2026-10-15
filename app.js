@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "4.7";
+const APP_VERSION = "5.0";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -40,6 +40,8 @@ const I = {
   leaf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19c0-8 5-13 15-14-1 10-6 15-14 15"/><path d="M5 19l7-7"/></svg>',
   target: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
   thermo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 14V5a2 2 0 1 1 4 0v9a4 4 0 1 1-4 0z"/></svg>',
+  trend: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
 };
 
@@ -52,12 +54,13 @@ const store = {
 
 const DEFAULT_CFG = { url: "", code: "", demo: false, staleHours: 24,
   work: { room: "Bureau", temp: 20, until: "18:00", base: 17 }, boost: { delta: 2, minutes: 60 },
-  hc: "01:04-07:04, 14:04-16:04",
+  hc: "01:04-07:04, 14:04-16:04", tarif: { name: "Engie", hp: 0.23612, hc: 0.17514, abo: 238.6 }, optimAt: null,
   place: { name: "Rezé", lat: 47.1797, lon: -1.5494 } };
 let cfg = Object.assign({}, DEFAULT_CFG, store.get("cfg", {}));
 cfg.work = Object.assign({}, DEFAULT_CFG.work, cfg.work);
 cfg.boost = Object.assign({}, DEFAULT_CFG.boost, cfg.boost);
 cfg.place = Object.assign({}, DEFAULT_CFG.place, cfg.place);
+cfg.tarif = Object.assign({}, DEFAULT_CFG.tarif, cfg.tarif);
 if (!cfg.staleHours || cfg.staleHours === 3) cfg.staleHours = 24; // les radiateurs au repos envoient rarement leur température
 
 const S = {
@@ -220,7 +223,53 @@ const demo = {
       }
       return { ok: true, results };
     }
+    if (action.startsWith("history")) return this.history();
+    if (action === "bilan") return { ok: true, bilan: this.history().bilan };
+    if (["ack", "config", "subscribe", "unsubscribe"].includes(action)) return { ok: true };
     throw new Error("Action inconnue");
+  },
+  // Historique simulé à partir de tes vrais plannings (14 jours, un relevé toutes les 15 minutes)
+  history() {
+    if (this.hist) return this.hist;
+    const rs = rooms();
+    const mesures = [], jours = new Map();
+    const t0 = Math.floor(nowS() / 900) * 900 - 14 * 86400;
+    const state = new Map(rs.map((r) => [r.name, 17]));
+    for (let t = t0; t <= nowS(); t += 900) {
+      const d = new Date(t * 1000);
+      const di = (d.getDay() + 6) % 7, min = d.getHours() * 60 + d.getMinutes();
+      const outdoor = 9 + 4 * Math.sin((min - 540) / 1440 * 2 * Math.PI) - (t - t0) / 86400 * 0.25;
+      const day = dayKey(t);
+      for (const r of rs) {
+        const target = r.on ? (r.levels[levelAt(r, di, min)] ?? r.target ?? 17) : null;
+        let temp = state.get(r.name);
+        const heating = target != null && temp < target - 0.1;
+        const rate = /bain/i.test(r.name) ? 2.2 : /bureau/i.test(r.name) ? 1.1 : 1.4;
+        const loss = /bureau/i.test(r.name) ? 0.07 : 0.03;
+        temp = heating ? temp + rate * 0.25 : temp - loss * (temp - outdoor) * 0.25;
+        state.set(r.name, temp);
+        mesures.push({ at: new Date(t * 1000).toISOString(), room: r.name, temp: Math.round(temp * 10) / 10, temp_at: null, target, heating, is_on: r.on, prog: r.prog, outdoor: Math.round(outdoor * 10) / 10 });
+        if (heating) {
+          const j = jours.get(day + r.name) || { day, room: r.name, kwh: 0, cost: 0, kwh_hp: 0, kwh_hc: 0, kwh_night: null };
+          const kwh = (r.watts || 1000) / 1000 * 0.25;
+          j.kwh += kwh; if (isHC(min)) { j.kwh_hc += kwh; j.cost += kwh * cfg.tarif.hc; } else { j.kwh_hp += kwh; j.cost += kwh * cfg.tarif.hp; }
+          jours.set(day + r.name, j);
+        }
+      }
+    }
+    const today = dayKey(nowS());
+    const days = [...new Set([...jours.values()].map((j) => j.day))].filter((d) => d < today);
+    for (const day of days) {
+      const rad = [...jours.values()].filter((j) => j.day === day).reduce((a, j) => a + j.kwh, 0);
+      const kwh = rad + 7.5;
+      jours.set(day + HOUSE, { day, room: HOUSE, kwh, cost: null, kwh_hp: kwh * 0.66, kwh_hc: kwh * 0.34, kwh_night: kwh * 0.27 });
+    }
+    const list = [...jours.values()].filter((j) => j.day < today).sort((a, b) => a.day < b.day ? -1 : 1);
+    const week = list.filter((j) => j.room !== HOUSE && j.day >= dayKey(nowS() - 7 * 86400));
+    const kwh = week.reduce((a, j) => a + j.kwh, 0), cost = week.reduce((a, j) => a + j.cost, 0);
+    this.hist = { mesures, jours: list, alertes: [{ key: "demo", at: new Date(Date.now() - 2 * 86400000).toISOString(), message: "Bureau n'arrive pas à chauffer : Le radiateur chauffe depuis 2 h mais la pièce reste à 16,2° pour 20° demandés. Fenêtre ouverte ?" }],
+      bilan: { date: today, lines: [`Cette semaine : ${nf1.format(kwh)} kWh, ${nf2.format(cost)} € (exemple calculé sur un historique simulé).`, "Pièce la plus gourmande : Salle de bain."] } };
+    return this.hist;
   },
 };
 
@@ -312,7 +361,7 @@ async function loadWeather() {
   if (c && Date.now() - c.at < 30 * 60000 && c.lat === cfg.place.lat) { S.weather = c; return; }
   try {
     const u = `https://api.open-meteo.com/v1/forecast?latitude=${cfg.place.lat}&longitude=${cfg.place.lon}` +
-      "&current=temperature_2m&daily=temperature_2m_mean,temperature_2m_min,temperature_2m_max&past_days=31&forecast_days=3&timezone=Europe%2FParis";
+      "&current=temperature_2m&daily=temperature_2m_mean,temperature_2m_min,temperature_2m_max&past_days=92&forecast_days=3&timezone=Europe%2FParis";
     const r = await fetch(u);
     const d = await r.json();
     const daily = {};
@@ -332,7 +381,7 @@ async function loadLinky(force = false) {
   try {
     const d = await api("linky" + (force ? "&force=1" : ""));
     S.linky = d; S.linkyError = null;
-    store.set("linky", { at: Date.now(), data: d });
+    if (d.configured && d.daily?.length) store.set("linky", { at: Date.now(), data: d }); else store.del("linky"); // pas de mémoire tant que Linky n'est pas branché
   } catch (e) { S.linkyError = e.message; }
   if (S.tab === "conso") render();
 }
@@ -340,9 +389,10 @@ function linkySplit(curve) {
   let hp = 0, hc = 0;
   for (const p of curve || []) {
     const end = new Date(p.end.replace(" ", "T"));
-    const start = new Date(end.getTime() - 30 * 60000);
-    const kwh = (p.w || 0) * 0.5 / 1000;
-    if (isHC(start.getHours() * 60 + start.getMinutes())) hc += kwh; else hp += kwh;
+    const step = p.step || 30;
+    const start = new Date(end.getTime() - step * 60000);
+    const kwh = (p.w || 0) * step / 60 / 1000;
+    if (isHC(start.getHours() * 60 + start.getMinutes() + step / 2)) hc += kwh; else hp += kwh;
   }
   return { hp, hc };
 }
@@ -530,7 +580,7 @@ function render() {
   if (S.tab === "optim" && (!habits.done || S.editHabits) && $("#h-wake")) return;
   if (!cfg.demo && !cfg.url) { app.innerHTML = welcomeView(); bindWelcome(); return; }
   const scrollY = window.scrollY;
-  app.innerHTML = `<div class="wrap">${topView()}${S.tab === "rooms" ? roomsView() : S.tab === "plan" ? planView() : S.tab === "optim" ? optimView() : consoView()}</div>${navView()}`;
+  app.innerHTML = `<div class="wrap">${topView()}${S.tab === "rooms" ? roomsView() : S.tab === "plan" ? planView() : S.tab === "optim" ? optimView() : S.tab === "suivi" ? suiviView() : consoView()}</div>${navView()}`;
   window.scrollTo(0, scrollY);
 }
 function renderTop() { const el = $("#refresh"); if (el) el.classList.toggle("spin", S.loading); }
@@ -545,6 +595,7 @@ function topView() {
   } else if (S.tab === "plan") title = "Planning";
   else if (S.tab === "conso") title = "Consommation";
   else if (S.tab === "optim") title = "Optimiser";
+  else if (S.tab === "suivi") title = "Suivi";
   const h = health();
   const sub = S.error ? `<span style="color:var(--alert)">${esc(S.error)}</span>` :
     S.fetchedAt ? `Données reçues ${ago(Math.round((Date.now() - S.fetchedAt) / 1000))}${S.fromCache ? " (hors ligne)" : ""}` : "Chargement…";
@@ -571,7 +622,7 @@ function topView() {
 
 function navView() {
   const t = (id, label, icon) => `<button role="tab" aria-selected="${S.tab === id}" data-tab="${id}">${icon}${label}</button>`;
-  return `<nav class="tabs" role="tablist"><div class="inner">${t("rooms", "Pièces", I.rooms)}${t("plan", "Planning", I.plan)}${t("optim", "Optimiser", I.leaf)}${t("conso", "Conso", I.conso)}</div></nav>`;
+  return `<nav class="tabs" role="tablist"><div class="inner">${t("rooms", "Pièces", I.rooms)}${t("plan", "Planning", I.plan)}${t("optim", "Optimiser", I.leaf)}${t("conso", "Conso", I.conso)}${t("suivi", "Suivi", I.trend)}</div></nav>`;
 }
 
 function heatPct(t) { if (t == null) return 30; return Math.round(Math.min(100, Math.max(0, (t - 15) / 7 * 100))); }
@@ -640,6 +691,9 @@ function planView() {
 function consoData() {
   if (!S.conso) return null;
   const byDay = new Map(), byRoom = new Map();
+  const named = new Set(S.conso.map((z) => z.zoneLabel).filter(Boolean));
+  const missing = rooms().map((r) => r.name).filter((n) => !named.has(n));
+  for (const z of S.conso) if (!z.zoneLabel) z.zoneLabel = missing.length === 1 ? missing[0] : "Non attribué";
   for (const z of S.conso) {
     for (const p of z.consumptionPeriods || []) {
       const key = p.date;
@@ -727,7 +781,7 @@ function linkyView(d) {
   if (S.linky == null && !S.linkyError) { loadLinky(); return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Lecture du compteur Linky…</p></div>`; }
   if (S.linkyError) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Linky indisponible : ${esc(S.linkyError)}</p><button class="btn" data-act="linky-retry">Réessayer</button></div>`;
   if (!S.linky.configured) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2>
-    <p class="help">${S.linky.demo ? "Le compteur Linky n'est pas lu en mode démo." : "Branche ton compteur Linky pour comparer la conso de toute la maison à celle des radiateurs : ajoute les secrets CHAUFFAGE_LINKY_TOKEN et CHAUFFAGE_LINKY_PRM dans Supabase (voir le guide)."}</p></div>`;
+    <p class="help">${S.linky.demo ? "Le compteur Linky n'est pas lu en mode démo." : "Branche ton compteur Linky pour comparer la conso de toute la maison à celle des radiateurs : ajoute les secrets CHAUFFAGE_LINKY_TOKEN et CHAUFFAGE_LINKY_PRM dans Supabase (voir le guide)."}</p>${S.linky.demo ? "" : `<button class="btn" data-act="linky-retry">Vérifier à nouveau</button>`}</div>`;
   const L = S.linky;
   const days = L.daily.slice(-14);
   if (!days.length) return `<div class="card"><h2 class="sec" style="margin-top:0">Toute la maison</h2><p class="help">Pas encore de données Linky.</p></div>`;
@@ -776,7 +830,7 @@ function guessUsage(name) {
 }
 function defaultHabits() {
   return { week: { wake: "07:00", leave: "08:30", back: "18:30", bed: "23:00" }, weekend: { wake: "08:30", bed: "23:30", out: false },
-    tt: [false, false, false, false, false], feel: "normal", usage: {}, done: false };
+    tt: [false, false, false, false, false], feel: "normal", usage: {}, anticip: "radiateur", done: false };
 }
 let habits = Object.assign(defaultHabits(), store.get("habits", {}));
 const usageOf = (r) => habits.usage[r.id] || guessUsage(r.name);
@@ -795,6 +849,8 @@ function proposal(room) {
   if (u === "guest") t[3] = t[2]; // nuit = éco : la pièce reste à température constante
   if (habits.feel === "frileux" && u !== "office") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
   if (habits.feel === "frais" && u !== "office") t[1] = Math.max(17, t[1] - 1);
+  // Avance de la montée en confort : nulle si les radiateurs anticipent eux-mêmes, apprise sinon
+  const lead = habits.anticip === "appli" ? (leadFor(room)?.min ?? 30) : 0;
   const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
   const week = [];
   for (let d = 0; d < 7; d++) {
@@ -805,11 +861,11 @@ function proposal(room) {
     const leave = we ? 10 * 60 : toMin(habits.week.leave);
     const back = we ? 18 * 60 : toMin(habits.week.back);
     let p = [];
-    if (u === "bedroom") p = [{ min: wake - 30, level: 1 }, { min: wake + 30, level: 2 }, { min: bed - 60, level: 1 }, { min: bed, level: 3 }];
-    if (u === "bath") p = [{ min: wake - 30, level: 1 }, { min: wake + 45, level: 2 }, { min: bed - 90, level: 1 }, { min: bed - 30, level: 3 }];
+    if (u === "bedroom") p = [{ min: wake - lead, level: 1 }, { min: wake + 30, level: 2 }, { min: bed - 60, level: 1 }, { min: bed, level: 3 }];
+    if (u === "bath") p = [{ min: wake - lead, level: 1 }, { min: wake + 45, level: 2 }, { min: bed - 90, level: 1 }, { min: bed - 30, level: 3 }];
     if (u === "office") p = null;
-    if (u === "living") p = home ? [{ min: wake - 30, level: 1 }, { min: bed, level: 3 }]
-      : [{ min: wake - 30, level: 1 }, { min: leave, level: 2 }, { min: back - 45, level: 1 }, { min: bed, level: 3 }];
+    if (u === "living") p = home ? [{ min: wake - lead, level: 1 }, { min: bed, level: 3 }]
+      : [{ min: wake - lead, level: 1 }, { min: leave, level: 2 }, { min: back - lead, level: 1 }, { min: bed, level: 3 }];
     if (u === "guest") p = null;
     // Heures creuses du matin : la montée en confort démarre avant la fin du tarif réduit si le réveil est juste après
     if (p) for (const e of morningHC) for (const x of p) if (x.level === 1 && x.min > e && x.min <= e + 90) x.min = e - 30;
@@ -905,6 +961,9 @@ function habitsForm(rs) {
       <label class="daypick"><label><input type="checkbox" id="h-out" ${h.weekend.out ? "checked" : ""}>Souvent dehors la journée</label></label></div>
     <div class="card"><h2 class="sec" style="margin-top:0">Ton ressenti</h2>
       <div class="seg" role="group">${[["frileux", "Frileux"], ["normal", "Normal"], ["frais", "J'aime le frais"]].map(([v, l]) => `<button type="button" aria-pressed="${h.feel === v}" data-feel="${v}">${l}</button>`).join("")}</div></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">Qui anticipe la montée en température ?</h2>
+      <div class="seg" role="group">${[["radiateur", "Les radiateurs"], ["appli", "L'appli"]].map(([v, l]) => `<button type="button" aria-pressed="${(h.anticip || "radiateur") === v}" data-anticip="${v}">${l}</button>`).join("")}</div>
+      <p class="help">Les radiateurs : l'option « Anticipation » de Cozytouch est activée, le confort est programmé à l'heure du lever et le radiateur démarre assez tôt pour y être. L'appli : coupe cette option, l'appli avance elle-même la montée selon la vitesse de chauffe mesurée dans chaque pièce (30 min tant qu'elle apprend). Ne combine pas les deux, la pièce chaufferait trop tôt.</p></div>
     <div class="card"><h2 class="sec" style="margin-top:0">À quoi sert chaque pièce ?</h2>
       ${rs.map((r) => `<label class="field"><span>${esc(r.name)}</span><select data-usage="${r.id}">${Object.entries(USAGES).map(([k, v]) => `<option value="${k}" ${usageOf(r) === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>`).join("")}</div>
     <button class="btn primary block" data-act="habits-save">Voir le programme proposé</button><p></p>`;
@@ -915,10 +974,348 @@ function saveHabits() {
   habits.weekend = { wake: v("h-wwake"), bed: v("h-wbed"), out: $("#h-out").checked };
   habits.tt = [0, 1, 2, 3, 4].map((k) => $(`[data-tt="${k}"]`).checked);
   habits.feel = $("[data-feel][aria-pressed='true']")?.dataset.feel || "normal";
+  habits.anticip = $("[data-anticip][aria-pressed='true']")?.dataset.anticip || "radiateur";
   document.querySelectorAll("[data-usage]").forEach((s) => { habits.usage[s.dataset.usage] = s.value; });
   habits.done = true; S.editHabits = false;
   store.set("habits", habits);
   render(); window.scrollTo(0, 0);
+}
+
+
+// ---------- Suivi (version 5) : historique enregistré par le relais toutes les 15 minutes
+// Tarifs réglementés EDF (Tarif Bleu TTC, 9 kVA) en vigueur depuis le 1er août 2026, pour la comparaison
+const TRV = { date: "1er août 2026", base: 0.1985, hp: 0.2142, hc: 0.1589, abo: 238.56,
+  tempo: { abo: 236.40, bleu: [0.1654, 0.1356], blanc: [0.1921, 0.1536], rouge: [0.7295, 0.1615] } };
+// Part de la conso d'un foyer chauffé à l'électricité qui tombe sur chaque couleur Tempo (ordre de grandeur sur un hiver)
+const TEMPO_MIX = { bleu: 0.70, blanc: 0.18, rouge: 0.12 };
+const HOUSE = "__maison__";
+
+async function loadHistory(force = false) {
+  if (S.histLoading) return;
+  if (!force && S.hist && Date.now() - S.histAt < 10 * 60000) return;
+  S.histLoading = true;
+  try { S.hist = await api("history&days=14"); S.histAt = Date.now(); S.histError = null; }
+  catch (e) { S.histError = e.message; }
+  S.histLoading = false;
+  if (S.tab === "suivi" || S.tab === "optim") render();
+}
+
+// Relevés d'une pièce, triés, en secondes
+function seriesOf(name) {
+  return (S.hist?.mesures || []).filter((m) => m.room === name).map((m) => ({ ...m, t: Date.parse(m.at) / 1000 }));
+}
+const median = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const k = Math.floor(s.length / 2); return s.length % 2 ? s[k] : (s[k - 1] + s[k]) / 2; };
+
+// Vitesse de chauffe apprise : degrés gagnés par heure quand le radiateur chauffe pour rattraper sa consigne
+function heatRate(name) {
+  const m = seriesOf(name);
+  const rates = [];
+  let run = null;
+  const close = () => {
+    if (run && run.gap0 >= 1 && run.t1 - run.t0 >= 45 * 60 && run.v1 - run.v0 >= 0.3) rates.push((run.v1 - run.v0) / ((run.t1 - run.t0) / 3600));
+    run = null;
+  };
+  for (const x of m) {
+    const cont = run && x.t - run.tLast <= 25 * 60;
+    if (x.heating && x.temp != null && x.target != null) {
+      if (!cont) { close(); run = { t0: x.t, v0: x.temp, t1: x.t, v1: x.temp, tLast: x.t, gap0: x.target - x.temp }; continue; }
+      run.t1 = x.t; run.v1 = x.temp; run.tLast = x.t;
+      if (x.temp >= x.target - 0.2) close(); // consigne atteinte : la montée est finie
+    } else {
+      if (cont && x.temp != null) { run.t1 = x.t; run.v1 = x.temp; }
+      close();
+    }
+  }
+  close();
+  return rates.length >= 2 ? { rate: median(rates), n: rates.length } : null;
+}
+// Vitesse de refroidissement, ramenée à l'écart avec l'extérieur (repère d'isolation ou de fenêtre ouverte)
+function coolRate(name) {
+  const m = seriesOf(name);
+  const ks = [];
+  let run = null;
+  const close = () => {
+    if (run && run.t1 - run.t0 >= 2 * 3600 && run.v0 - run.v1 >= 0.3 && run.gap > 4) ks.push((run.v0 - run.v1) / ((run.t1 - run.t0) / 3600) / run.gap);
+    run = null;
+  };
+  for (let i = 0; i < m.length; i++) {
+    const x = m[i], prev = m[i - 1];
+    const ok = !x.heating && x.temp != null && x.outdoor != null;
+    if (!ok || (prev && x.t - prev.t > 25 * 60) || (run && x.temp > run.v1 + 0.15)) { close(); if (!ok) continue; }
+    if (!run) run = { t0: x.t, v0: x.temp, t1: x.t, v1: x.temp, gap: x.temp - x.outdoor };
+    else { run.t1 = x.t; run.v1 = x.temp; }
+  }
+  close();
+  return ks.length >= 2 ? median(ks) : null;
+}
+// Temps de chauffe par jour (7 derniers jours)
+function dutyOf(name) {
+  const since = Date.now() / 1000 - 7 * 86400;
+  const m = seriesOf(name).filter((x) => x.t >= since);
+  if (m.length < 96) return null;
+  const span = (m[m.length - 1].t - m[0].t) / 86400;
+  return { hours: m.filter((x) => x.heating).length / m.length * 24, days: span };
+}
+// Avance nécessaire pour passer de l'éco au confort, arrondie au quart d'heure
+function leadFor(room) {
+  const h = heatRate(room.name);
+  if (!h || h.rate <= 0.05) return null;
+  const delta = (room.levels[1] ?? 19) - (room.levels[2] ?? 16);
+  if (delta <= 0) return null;
+  return { min: Math.min(150, Math.max(15, Math.ceil(delta / h.rate * 4) * 15)), rate: h.rate, delta };
+}
+
+// Conso par jour des radiateurs : historique du relais, complété par Cozytouch
+function radiatorDays() {
+  const out = new Map();
+  for (const j of S.hist?.jours || []) if (j.room !== HOUSE && j.kwh != null) out.set(j.day, (out.get(j.day) || 0) + j.kwh);
+  const d = consoData();
+  for (const x of d?.days || []) { const k = dayKey(x.date); if (!out.has(k)) out.set(k, x.hp + x.hc); }
+  return out;
+}
+const djuOf = (day) => { const w = S.weather?.daily?.[day]; return w?.mean != null ? Math.max(0, 18 - w.mean) : null; };
+function perDju(days) {
+  let kwh = 0, dju = 0, n = 0;
+  for (const [day, v] of days) { const g = djuOf(day); if (g == null) continue; kwh += v; dju += g; n++; }
+  return { kwh, dju, n, ratio: dju >= 10 ? kwh / dju : null };
+}
+function savings() {
+  const today = dayKey(nowS());
+  const all = [...radiatorDays().entries()].filter(([d]) => d < today).sort((a, b) => a[0] < b[0] ? -1 : 1);
+  if (cfg.optimAt) {
+    const before = perDju(all.filter(([d]) => d < cfg.optimAt));
+    const after = perDju(all.filter(([d]) => d > cfg.optimAt));
+    if (before.ratio && after.ratio && before.n >= 3 && after.n >= 3) return { mode: "optim", before, after, pct: Math.round((after.ratio / before.ratio - 1) * 100) };
+    return { mode: "wait", before, after };
+  }
+  const cut = dayKey(nowS() - 7 * 86400);
+  const before = perDju(all.filter(([d]) => d < cut).slice(-7));
+  const after = perDju(all.filter(([d]) => d >= cut));
+  if (before.ratio && after.ratio) return { mode: "week", before, after, pct: Math.round((after.ratio / before.ratio - 1) * 100) };
+  return { mode: "wait", before, after };
+}
+
+// Découpage de la conso de la maison : historique, ou à défaut la courbe Linky des 7 derniers jours
+function houseSplit() {
+  const rows = (S.hist?.jours || []).filter((j) => j.room === HOUSE && j.kwh_hp != null && j.kwh_hc != null);
+  if (rows.length >= 3) return { days: rows.length, hp: rows.reduce((s, j) => s + j.kwh_hp, 0), hc: rows.reduce((s, j) => s + j.kwh_hc, 0), night: rows.reduce((s, j) => s + (j.kwh_night || 0), 0) };
+  const curve = S.linky?.curve || [];
+  const minutes = curve.reduce((a, p) => a + (p.step || 30), 0);
+  if (minutes < 2 * 1440) return null;
+  let hp = 0, hc = 0, night = 0;
+  for (const p of curve) {
+    const step = p.step || 30;
+    const end = new Date(p.end.replace(" ", "T"));
+    const start = (end.getHours() * 60 + end.getMinutes() + 1440 - step) % 1440;
+    const kwh = (p.w || 0) * step / 60 / 1000;
+    if (isHC(start + step / 2)) hc += kwh; else hp += kwh;
+    if (start >= 1320 || start < 360) night += kwh;
+  }
+  return { days: Math.round(minutes / 1440), hp, hc, night };
+}
+function contract() {
+  const s = houseSplit();
+  if (!s || s.hp + s.hc < 1) return null;
+  const tot = s.hp + s.hc, day = tot - s.night;
+  const t = cfg.tarif;
+  const tempoDay = TEMPO_MIX.bleu * TRV.tempo.bleu[0] + TEMPO_MIX.blanc * TRV.tempo.blanc[0] + TEMPO_MIX.rouge * TRV.tempo.rouge[0];
+  const tempoNight = TEMPO_MIX.bleu * TRV.tempo.bleu[1] + TEMPO_MIX.blanc * TRV.tempo.blanc[1] + TEMPO_MIX.rouge * TRV.tempo.rouge[1];
+  const yearAbo = (abo) => abo * s.days / 365;
+  const offers = [
+    { key: "mine", name: `Ton contrat (${t.name || "actuel"})`, cost: s.hp * t.hp + s.hc * t.hc + yearAbo(t.abo) },
+    { key: "trvhc", name: "Tarif Bleu EDF heures creuses", cost: s.hp * TRV.hp + s.hc * TRV.hc + yearAbo(TRV.abo) },
+    { key: "base", name: "Tarif Bleu EDF base", cost: tot * TRV.base + yearAbo(TRV.abo) },
+    { key: "tempo", name: "Tempo EDF (estimation)", cost: day * tempoDay + s.night * tempoNight + yearAbo(TRV.tempo.abo), approx: true },
+  ];
+  const mine = offers[0].cost;
+  for (const o of offers) o.diff = o.cost - mine;
+  // Part d'heures creuses à partir de laquelle l'option heures creuses bat l'option base (Tarif Bleu)
+  const breakEven = (TRV.hp - TRV.base) / (TRV.hp - TRV.hc);
+  return { ...s, tot, offers, hcShare: s.hc / tot, breakEven };
+}
+
+// Conseils tirés des relevés
+function dataAdvice() {
+  const out = [];
+  const rs = rooms();
+  if (!S.hist?.mesures?.length) return out;
+  const duty = rs.map((r) => ({ r, d: dutyOf(r.name) })).filter((x) => x.d);
+  if (duty.length) {
+    const est = duty.map((x) => ({ ...x, kwh: x.d.hours * (x.r.watts || 1000) / 1000 })).sort((a, b) => b.kwh - a.kwh);
+    const top = est[0];
+    if (top.kwh > 0.5) out.push({ title: `${top.r.name} chauffe ${nf1.format(top.d.hours)} h par jour`, text: `C'est la pièce qui tire le plus (environ ${nf1.format(top.kwh)} kWh par jour avec ses ${top.r.watts || 1000} W). Un degré de moins sur son confort, c'est environ 7 % de moins sur ce poste.` });
+  }
+  const ks = rs.map((r) => ({ r, k: coolRate(r.name) })).filter((x) => x.k != null);
+  if (ks.length >= 3) {
+    const med = median(ks.map((x) => x.k));
+    for (const x of ks) if (x.k > med * 1.7) out.push({ title: `${x.r.name} perd sa chaleur plus vite que les autres pièces`, text: "Quand le radiateur s'arrête, la température y baisse nettement plus vite qu'ailleurs, à écart égal avec l'extérieur. Vérifie la fenêtre (joint, entrebâillement), une porte vers une pièce froide ou une bouche d'aération." });
+  }
+  for (const r of rs) {
+    const m = seriesOf(r.name).filter((x) => x.is_on && x.temp != null && x.target != null && !x.heating);
+    if (m.length < 96) continue;
+    const warm = m.filter((x) => x.temp - x.target > 1.5).length / m.length;
+    if (warm > 0.4) out.push({ title: `${r.name} est souvent plus chaude que sa consigne`, text: `${Math.round(warm * 100)} % du temps, la pièce dépasse sa consigne de plus de 1,5° sans que son radiateur chauffe : la chaleur vient d'ailleurs (soleil, pièce voisine). Son radiateur ne consomme alors rien, il n'y a rien à gagner à baisser ses réglages.` });
+  }
+  const tt = rs.find((r) => r.name.toLowerCase() === String(cfg.work.room).toLowerCase());
+  if (tt) {
+    const m = seriesOf(tt.name);
+    const ttDays = new Set(m.filter((x) => x.target != null && Math.abs(x.target - cfg.work.temp) < 0.01).map((x) => x.at.slice(0, 10)));
+    if (m.length > 96 * 5) out.push({ title: `Télétravail : ${ttDays.size} jour${ttDays.size > 1 ? "s" : ""} sur les 14 derniers`, text: `${tt.name} n'a été chauffé à ${deg(cfg.work.temp)}° que ces jours-là, et reste à ${deg(cfg.work.base ?? 17)}° le reste du temps.` });
+  }
+  return out;
+}
+
+// Graphique des températures sur 48 h
+function tempChart(name) {
+  const since = Date.now() / 1000 - 48 * 3600;
+  const m = seriesOf(name).filter((x) => x.t >= since);
+  if (m.length < 4) return `<p class="help">Pas encore assez de relevés pour cette pièce. Le premier graphique apparaît après quelques heures.</p>`;
+  const W_ = 320, H = 150, padL = 26, padB = 18, padT = 8;
+  const vals = m.flatMap((x) => [x.temp, x.target, x.outdoor]).filter((v) => v != null);
+  const lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
+  const X = (t) => padL + (t - since) / (48 * 3600) * (W_ - padL);
+  const Y = (v) => padT + (hi - v) / (hi - lo) * (H - padB - padT);
+  const line = (k, step) => {
+    let d = "", prev = null;
+    for (const x of m) {
+      if (x[k] == null) { prev = null; continue; }
+      const px = X(x.t).toFixed(1), py = Y(x[k]).toFixed(1);
+      d += prev == null ? `M${px},${py}` : step ? `H${px}V${py}` : `L${px},${py}`;
+      prev = x;
+    }
+    return d;
+  };
+  const heat = m.map((x, i) => x.heating && m[i + 1] ? `<rect x="${X(x.t).toFixed(1)}" y="${H - padB - 4}" width="${Math.max(1, X(m[i + 1].t) - X(x.t)).toFixed(1)}" height="4" fill="var(--hp)"/>` : "").join("");
+  const grid = [];
+  for (let v = lo; v <= hi; v += Math.max(1, Math.round((hi - lo) / 4))) grid.push(`<line x1="${padL}" x2="${W_}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--line)"/><text x="${padL - 4}" y="${Y(v) + 3}" text-anchor="end" font-size="9" fill="var(--ink-2)">${v}°</text>`);
+  const ticks = [];
+  const d0 = new Date(since * 1000); d0.setMinutes(0, 0, 0);
+  for (let t = d0.getTime() / 1000 + 3600; t < Date.now() / 1000; t += 3600) {
+    const h = new Date(t * 1000).getHours();
+    if (h % 12 === 0) ticks.push(`<line x1="${X(t)}" x2="${X(t)}" y1="${padT}" y2="${H - padB}" stroke="var(--line)" stroke-dasharray="2 3"/><text x="${X(t)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="var(--ink-2)">${h === 0 ? new Date(t * 1000).toLocaleDateString("fr-FR", { weekday: "short" }) : "12 h"}</text>`);
+  }
+  return `<div class="legend"><span><i style="background:var(--accent)"></i>Pièce</span><span><i style="background:var(--ink-2)"></i>Consigne</span><span><i style="background:var(--ink-3, #9AA5AE)"></i>Dehors</span><span><i style="background:var(--hp)"></i>Chauffe</span></div>
+    <div class="chart"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Températures de ${esc(name)} sur 48 heures">${grid.join("")}${ticks.join("")}${heat}
+      <path d="${line("outdoor")}" fill="none" stroke="var(--ink-3, #9AA5AE)" stroke-width="1.2" stroke-dasharray="1 3" stroke-linecap="round"/>
+      <path d="${line("target", true)}" fill="none" stroke="var(--ink-2)" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <path d="${line("temp")}" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linejoin="round"/></svg></div>`;
+}
+
+function suiviView() {
+  if (S.hist == null && !S.histError) { loadHistory(); if (S.conso == null) loadConso(); return `<div class="empty">Chargement de l'historique…</div>`; }
+  if (S.conso == null && !S.consoError) loadConso();
+  if (S.linky == null && !S.linkyError && !cfg.demo) loadLinky();
+  if (S.histError) {
+    const setup = /Tables|absentes|Action inconnue|Base Supabase/.test(S.histError);
+    return `<div class="card"><h2 class="sec" style="margin-top:0">Historique pas encore branché</h2>
+      <p class="help">${setup ? "Le relais doit être mis à jour et les tables créées dans Supabase : suis l'étape « Version 5 » du guide." : `Historique indisponible : ${esc(S.histError)}`}</p>
+      <button class="btn" data-act="hist-retry">Réessayer</button></div>`;
+  }
+  const H = S.hist;
+  const rs = rooms();
+  const first = H.mesures[0]?.at;
+  let html = "";
+  if (!H.mesures.length) html += `<div class="banner info"><div class="b-body"><strong>L'historique démarre.</strong> Le relais enregistre tes pièces toutes les 15 minutes. Les premiers graphiques apparaissent dans quelques heures, les conseils après quelques jours.</div></div>`;
+
+  // Bilan de la semaine
+  const b = H.bilan;
+  html += `<div class="card"><h2 class="sec" style="margin-top:0">Bilan de la semaine</h2>
+    ${b?.lines ? `<p class="muted" style="margin-top:0">Calculé le ${new Date(b.date + "T12:00").toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" })}</p>${b.lines.map((l) => `<p style="margin:0 0 6px">${esc(l)}</p>`).join("")}`
+      : `<p class="help">Le premier bilan arrive dimanche soir, par notification${cfg.demo ? "" : " et par e-mail si tu l'as réglé"}.</p>`}
+    <button class="btn" data-act="bilan-now">Calculer maintenant</button></div>`;
+
+  // Économies à météo égale
+  const sv = savings();
+  const fmtR = (p) => p.ratio ? `${nf2.format(p.ratio)} kWh par degré-jour` : "–";
+  let svBody;
+  if (sv.mode === "wait") svBody = `<p class="help">${cfg.optimAt ? `Il faut au moins 3 jours de chauffage avant et après le ${new Date(cfg.optimAt + "T12:00").toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}, date du programme optimisé, et assez de froid pour comparer.` : "Pas encore assez de jours froids pour comparer deux semaines."} La mesure se fait à météo égale : la conso est divisée par les degrés-jours (l'écart entre 18° et la température moyenne dehors).</p>`;
+  else svBody = `<p><b class="num" style="font-size:28px">${sv.pct <= 0 ? "−" + -sv.pct : "+" + sv.pct} %</b> <span class="muted">${sv.mode === "optim" ? "depuis le programme optimisé, à météo égale" : "cette semaine par rapport à la précédente, à météo égale"}</span></p>
+    <p class="help">${sv.mode === "optim" ? "Avant" : "Semaine précédente"} : ${fmtR(sv.before)} sur ${sv.before.n} jours. ${sv.mode === "optim" ? "Après" : "Cette semaine"} : ${fmtR(sv.after)} sur ${sv.after.n} jours. Diviser par les degrés-jours neutralise la météo : une semaine plus froide ne fausse pas la comparaison.</p>`;
+  html += `<div class="card"><h2 class="sec" style="margin-top:0">Économies réelles</h2>${svBody}</div>`;
+
+  // Températures 48 h
+  if (H.mesures.length) {
+    if (!S.histRoom || !rs.find((r) => r.name === S.histRoom)) S.histRoom = rs[0]?.name;
+    html += `<div class="card"><h2 class="sec" style="margin-top:0">Températures sur 48 h</h2>
+      <div class="chips" role="group" aria-label="Pièce">${rs.map((r) => `<button aria-pressed="${r.name === S.histRoom}" data-hroom="${esc(r.name)}">${esc(r.name)}</button>`).join("")}</div>
+      ${tempChart(S.histRoom)}</div>`;
+  }
+
+  // Préchauffage appris
+  const leads = rs.map((r) => ({ r, l: leadFor(r) }));
+  html += `<div class="card"><h2 class="sec" style="margin-top:0">Préchauffage</h2>
+    ${leads.some((x) => x.l) ? `<div class="rlist">${leads.map(({ r, l }) => `<div class="r"><span>${esc(r.name)}</span><span class="num">${l ? `<b>${nf1.format(l.rate)}° par heure</b> <span class="muted">${duration(l.min)} pour +${deg(l.delta)}°</span>` : `<span class="muted">en apprentissage</span>`}</span></div>`).join("")}</div>
+      <p class="help">Mesuré quand le radiateur rattrape sa consigne. ${habits.anticip === "appli" ? "L'onglet Optimiser avance la montée en confort d'autant." : "Tes radiateurs gèrent l'anticipation eux-mêmes : ces chiffres servent de contrôle. Tu peux confier l'anticipation à l'appli dans Optimiser."}</p>`
+      : `<p class="help">L'appli apprend à quelle vitesse chaque pièce monte en température. Il lui faut au moins deux montées en confort par pièce.</p>`}</div>`;
+
+  // Conseils tirés des relevés
+  const adv = dataAdvice();
+  if (adv.length) html += `<div class="card"><h2 class="sec" style="margin-top:0">Ce que disent tes relevés</h2>${adv.map((a) => `<div class="tip-row"><b>${esc(a.title)}</b><p class="help">${esc(a.text)}</p></div>`).join("")}</div>`;
+
+  // Contrat
+  const c = contract();
+  const t = cfg.tarif;
+  html += `<div class="card"><h2 class="sec" style="margin-top:0">Ton contrat est-il le bon ?</h2>
+    <p class="help">Ton tarif : ${nf2.format(t.hp * 100)} c€ en heures pleines, ${nf2.format(t.hc * 100)} c€ en heures creuses, abonnement ${nf2.format(t.abo)} € par an. Modifiable dans la roue crantée.</p>
+    ${c ? `<p class="help">Sur ${c.days} jours de compteur Linky (${nf1.format(c.tot)} kWh, dont ${Math.round(c.hcShare * 100)} % en heures creuses), abonnement compris :</p>
+      <div class="rlist">${c.offers.map((o) => `<div class="r"><span>${esc(o.name)}</span><span class="num"><b>${nf2.format(o.cost)} €</b> ${o.key === "mine" ? "" : `<span class="${o.diff < -0.005 ? "good" : "muted"}">${o.diff < 0 ? "−" : "+"}${Math.round(Math.abs(o.diff) / c.offers[0].cost * 100)} %</span>`}</span></div>`).join("")}</div>
+      <p class="help">${c.hcShare >= c.breakEven ? `Avec ${Math.round(c.hcShare * 100)} % en heures creuses, l'option heures creuses est la bonne : au Tarif Bleu, elle bat l'option base dès ${Math.round(c.breakEven * 100)} %.` : `Avec ${Math.round(c.hcShare * 100)} % en heures creuses, l'option base serait plus adaptée : au Tarif Bleu, l'option heures creuses n'est gagnante qu'à partir de ${Math.round(c.breakEven * 100)} %.`}
+      Tarifs EDF au ${TRV.date}. Tempo est une estimation : le prix dépend du nombre de jours rouges, et un jour rouge coûte ${nf2.format(TRV.tempo.rouge[0] * 100)} c€ le kWh en journée.</p>`
+      : `<p class="help">${S.linky?.configured ? "La courbe de charge Linky n'est pas encore disponible. Active « l'enregistrement de la consommation horaire » dans ton espace Enedis : la comparaison apparaît un ou deux jours après." : "Branche ton compteur Linky (voir le guide) : la comparaison se fait sur ta vraie courbe de consommation, heure par heure."}</p>`}</div>`;
+
+  // Alertes récentes
+  if (H.alertes?.length) html += `<div class="card"><h2 class="sec" style="margin-top:0">Dernières alertes</h2>${H.alertes.slice(0, 8).map((a) => `<div class="tip-row"><b>${esc(a.message)}</b><p class="help">${dateFr(Date.parse(a.at) / 1000)}</p></div>`).join("")}</div>`;
+  html += `<p class="help">${first ? `Historique enregistré depuis le ${new Date(first).toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}. ` : ""}${pushState() === "on" ? "Les alertes arrivent en notification sur ce téléphone." : `<button class="btn" data-act="push-on">Recevoir les alertes en notification</button>`}</p>`;
+  return html;
+}
+
+// ---------- Notifications
+function pushState() {
+  if (cfg.demo) return "demo";
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return "unsupported";
+  if (Notification.permission === "denied") return "denied";
+  return store.get("pushOn", false) && Notification.permission === "granted" ? "on" : "off";
+}
+function b64ToU8(b64) {
+  const s = atob((b64 + "=".repeat((4 - b64.length % 4) % 4)).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(s, (c) => c.charCodeAt(0));
+}
+async function enablePush() {
+  const st = pushState();
+  if (st === "demo") return toast("Pas de notifications en mode démo");
+  if (st === "unsupported") return toast("Ce navigateur ne gère pas les notifications. Ouvre l'appli dans Chrome.");
+  if (st === "denied") return toast("Notifications bloquées : autorise-les dans les réglages du site, dans Chrome");
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") return toast("Notifications refusées");
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api("vapid");
+    let sub = await reg.pushManager.getSubscription();
+    if (sub && store.get("pushKey", "") !== publicKey) { await sub.unsubscribe(); sub = null; }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToU8(publicKey) });
+    await api("subscribe", "POST", { sub: sub.toJSON() });
+    store.set("pushOn", true); store.set("pushKey", publicKey);
+    toast("Alertes activées sur ce téléphone");
+  } catch (e) { toast("Activation impossible : " + e.message); }
+  render();
+}
+async function disablePush() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) { await api("unsubscribe", "POST", { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe(); }
+  } catch { /* rien */ }
+  store.set("pushOn", false); toast("Alertes coupées sur ce téléphone"); render();
+}
+
+// Le relais a besoin de tes heures creuses et des défauts masqués pour ses calculs et ses alertes
+async function syncRelay() {
+  if (cfg.demo || !cfg.url) return;
+  try {
+    if (store.get("hcSynced", "") !== cfg.hc) { await api("config", "POST", { hc: cfg.hc }); store.set("hcSynced", cfg.hc); }
+    const done = store.get("acksSynced", []);
+    for (const k of faultAcks.filter((k) => !done.includes(k))) { await api("ack", "POST", { key: k }); done.push(k); store.set("acksSynced", done); }
+  } catch { /* relais pas encore à jour : on réessaiera au prochain lancement */ }
 }
 
 // ---------- Feuilles (fenêtres du bas)
@@ -1130,11 +1527,27 @@ function openSettings() {
       <label class="field"><span>Durée (min)</span><input id="s-bmin" type="number" step="15" min="15" max="240" value="${cfg.boost.minutes}"></label></div>
     <h2 class="sec">Tarif et météo</h2>
     <label class="field"><span>Heures creuses</span><input id="s-hc" type="text" value="${esc(cfg.hc)}" placeholder="01:04-07:04, 14:04-16:04"></label>
+    <div class="row"><label class="field"><span>Heures pleines (€/kWh)</span><input id="s-thp" type="number" step="0.00001" min="0" value="${cfg.tarif.hp}"></label>
+      <label class="field"><span>Heures creuses (€/kWh)</span><input id="s-thc" type="number" step="0.00001" min="0" value="${cfg.tarif.hc}"></label></div>
+    <div class="row"><label class="field"><span>Abonnement (€/an)</span><input id="s-tabo" type="number" step="0.01" min="0" value="${cfg.tarif.abo}"></label>
+      <label class="field"><span>Fournisseur</span><input id="s-tname" type="text" value="${esc(cfg.tarif.name)}"></label></div>
     <label class="field"><span>Commune (pour la météo)</span><input id="s-place" type="text" value="${esc(cfg.place.name)}"></label>
     <label class="field"><span>Alerte si plus de nouvelles des radiateurs depuis (heures)</span><input id="s-stale" type="number" min="1" max="72" value="${cfg.staleHours}"></label>
     <p class="help">Un radiateur au repos n'envoie sa température que lorsqu'elle change : quelques heures sans mesure sont normales.</p>
-    <button class="btn primary block" data-save>Enregistrer</button>
+    <label class="field"><span>Programme optimisé appliqué le (point de départ des économies)</span><input id="s-optim" type="date" value="${esc(cfg.optimAt || "")}"></label>
+    <h2 class="sec">Alertes</h2>
+    ${(() => { const st = pushState(); return st === "on" ? `<p class="help">Les alertes arrivent en notification sur ce téléphone : radiateur injoignable, défaut, pièce qui n'arrive pas à chauffer, conso inhabituelle, CozyBox muette, et le bilan du dimanche.</p><div class="row"><button class="btn" data-push="test">Envoyer un test</button><button class="btn" data-push="off">Couper</button></div>`
+      : st === "demo" ? `<p class="help">Pas de notifications en mode démo.</p>` : st === "unsupported" ? `<p class="help">Ce navigateur ne gère pas les notifications. Ouvre l'appli installée depuis Chrome.</p>`
+      : st === "denied" ? `<p class="help">Les notifications sont bloquées pour ce site. Dans Chrome : cadenas à gauche de l'adresse, puis Autorisations, puis Notifications.</p>`
+      : `<button class="btn block" data-push="on">${I.bell}Recevoir les alertes sur ce téléphone</button>`; })()}
+    <p></p><button class="btn primary block" data-save>Enregistrer</button>
     <p class="help" style="text-align:center">Version ${APP_VERSION}</p>`, (el) => {
+    el.querySelectorAll("[data-push]").forEach((b) => b.onclick = async () => {
+      const k = b.dataset.push; closeSheet();
+      if (k === "on") enablePush();
+      if (k === "off") disablePush();
+      if (k === "test") api("testpush", "POST", {}).then((d) => toast(d.sent ? "Notification envoyée" : "Aucun téléphone abonné : réactive les alertes")).catch((e) => toast(e.message));
+    });
     const tog = (id) => el.querySelector(id)?.addEventListener("click", (e) => { const b = e.currentTarget; b.setAttribute("aria-checked", b.getAttribute("aria-checked") !== "true"); });
     tog("#s-demo"); tog("#s-stuck");
     el.querySelector("[data-save]").onclick = () => {
@@ -1148,6 +1561,9 @@ function openSettings() {
       cfg.boost = { delta: +el.querySelector("#s-bdelta").value || 2, minutes: +el.querySelector("#s-bmin").value || 60 };
       cfg.staleHours = Math.max(6, +el.querySelector("#s-stale").value || 24);
       cfg.hc = el.querySelector("#s-hc").value.trim() || cfg.hc;
+      cfg.tarif = { name: el.querySelector("#s-tname").value.trim() || "actuel", hp: +el.querySelector("#s-thp").value || cfg.tarif.hp,
+        hc: +el.querySelector("#s-thc").value || cfg.tarif.hc, abo: +el.querySelector("#s-tabo").value || cfg.tarif.abo };
+      cfg.optimAt = el.querySelector("#s-optim").value || null;
       const place = el.querySelector("#s-place").value.trim();
       if (place && place !== cfg.place.name) {
         fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1&language=fr&countryCode=FR`)
@@ -1160,7 +1576,7 @@ function openSettings() {
       store.set("cfg", cfg);
       closeSheet();
       if (wasDemo !== cfg.demo) { S.setup = null; S.conso = null; S.fetchedAt = 0; store.del("lastState"); }
-      render(); refresh();
+      render(); refresh(); syncRelay();
     };
   });
 }
@@ -1186,14 +1602,15 @@ function bindWelcome() {
 }
 
 // ---------- Actions globales
-function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0, 0); if (t === "conso" && S.conso == null) loadConso(); }
+function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0, 0); if (t === "conso" && S.conso == null) loadConso(); if (t === "suivi" || t === "optim") loadHistory(); }
 
 document.addEventListener("click", (e) => {
   if (sheetEl && sheetEl.contains(e.target)) return;
-  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel],[data-fault-ack]");
+  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel],[data-anticip],[data-fault-ack],[data-hroom]");
   if (!t) return;
   if (t.dataset.tab) return setTab(t.dataset.tab);
   if (t.dataset.room) return openRoom(+t.dataset.room);
+  if (t.dataset.hroom) { S.histRoom = t.dataset.hroom; return render(); }
   if (t.dataset.planRoom) { S.planRoom = +t.dataset.planRoom; return render(); }
   if (t.dataset.day) return openDay(S.planRoom, +t.dataset.day);
   if (t.dataset.level) return openLevel(S.planRoom, +t.dataset.level);
@@ -1201,15 +1618,19 @@ document.addEventListener("click", (e) => {
   if (t.dataset.dismiss) return dismissJob(+t.dataset.dismiss);
   if (t.dataset.optApply) {
     const r = roomById(+t.dataset.optApply); const prop = proposal(r);
-    if (r && prop && confirm(`Envoyer le programme proposé à ${r.name} ?`)) runJob(`${r.name} : programme optimisé`, writesProposal(r, prop));
+    if (r && prop && confirm(`Envoyer le programme proposé à ${r.name} ?`)) {
+      runJob(`${r.name} : programme optimisé`, writesProposal(r, prop));
+      if (!cfg.optimAt) { cfg.optimAt = dayKey(nowS()); store.set("cfg", cfg); } // point de départ de la mesure des économies
+    }
     return;
   }
   if (t.dataset.faultAck) {
     if (confirm("Masquer ce défaut ? Il ne réapparaîtra que si un nouveau code arrive.")) {
-      faultAcks = [...new Set([...faultAcks, t.dataset.faultAck])]; store.set("faultAcks", faultAcks); render();
+      faultAcks = [...new Set([...faultAcks, t.dataset.faultAck])]; store.set("faultAcks", faultAcks); render(); syncRelay();
     }
     return;
   }
+  if (t.dataset.anticip) { document.querySelectorAll("[data-anticip]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
   if (t.dataset.feel) { document.querySelectorAll("[data-feel]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
   if (t.dataset.reco) { const r = S.recos?.[+t.dataset.reco]; if (r && confirm(`${r.title} ?`)) applyReco(r); return; }
   const a = t.dataset.act;
@@ -1219,6 +1640,11 @@ document.addEventListener("click", (e) => {
   if (a === "conso-retry") { S.consoError = null; S.conso = null; render(); }
   if (a === "habits-save") return saveHabits();
   if (a === "habits-edit") { S.editHabits = true; render(); window.scrollTo(0, 0); return; }
+  if (a === "hist-retry") { S.histError = null; S.hist = null; render(); }
+  if (a === "push-on") enablePush();
+  if (a === "bilan-now") {
+    api("bilan", "POST", { mail: false }).then((d) => { if (S.hist) S.hist.bilan = d.bilan; toast("Bilan calculé"); render(); }).catch((e) => toast(e.message));
+  }
   if (a === "linky-retry") { S.linkyError = null; S.linky = null; loadLinky(true); render(); }
   if (a === "all-on") {
     const writes = rs.flatMap((r) => [...(!r.on ? writesPower(r, true) : []), ...(!r.prog ? [W(r, C.PROG, "1")] : [])]);
@@ -1276,8 +1702,11 @@ render = function () { _render(); if (roomSheetRedraw && sheetEl && sheetEl.data
 
 // ---------- Démarrage
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+// Ouverture depuis une notification : onglet demandé
+{ const t = new URLSearchParams(location.search).get("tab"); if (["rooms", "plan", "optim", "conso", "suivi"].includes(t)) { S.tab = t; store.set("tab", t); history.replaceState(null, "", location.pathname); } }
+if ("serviceWorker" in navigator) navigator.serviceWorker.addEventListener("message", (e) => { if (e.data?.tab) setTab(e.data.tab); });
 render();
-if (cfg.demo || cfg.url) { refresh(); loadWeather(); }
+if (cfg.demo || cfg.url) { refresh(); loadWeather(); syncRelay(); if (S.tab === "suivi" || S.tab === "optim") loadHistory(); }
 setInterval(() => { if (document.visibilityState === "visible" && (cfg.demo || cfg.url) && !S.jobs.some((j) => j.status === "verifying")) refresh({ quiet: true }); }, 60000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && (cfg.demo || cfg.url)) refresh({ quiet: true }); });
 })();
