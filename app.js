@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "5.0";
+const APP_VERSION = "5.1";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -127,6 +127,10 @@ function rooms() {
     const tempOk = v(C.TEMP_OK) == null || v(C.TEMP_OK) === "1";
     return {
       id: d.deviceId, dev: d, caps: c,
+      // Cozytouch laisse parfois « indisponible » sur un radiateur qui répond très bien (après un réappairage) :
+      // on ne le dit injoignable que s'il n'a rien envoyé depuis 3 h
+      available: d.isAvailable !== false || (rad && rad.isAvailable !== false) ||
+        nowS() - Math.max(0, ...[...(d.capabilities || []), ...(rad?.capabilities || [])].map((x) => x.modificationDate || 0)) < 3 * 3600,
       name: v(C.NAME) || d.name,
       model: rad ? rad.longName : "",
       watts: rc[C.POWER_W] ? num(rc[C.POWER_W].value) : null,
@@ -638,7 +642,7 @@ function roomsView() {
     ${work ? `<button class="scene${workActive(work) ? " on" : ""}" data-act="work" aria-pressed="${workActive(work)}">${I.laptop}<span>${workActive(work) ? "Télétravail en cours" : "Télétravail"}</span></button>` : ""}
     <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button></div>`;
   const tiles = rs.map((r) => {
-    const mode = r.dev.isAvailable === false ? "Injoignable" : !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
+    const mode = !r.available ? "Injoignable" : !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
     const hasFault = (S.faults || []).some((f) => f.deviceId === r.id && !isAcked(f));
     const badge = pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>'
       : hasFault ? `<span class="badge fault" title="Défaut signalé">${I.warn}</span>`
