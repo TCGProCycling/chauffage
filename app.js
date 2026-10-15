@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "5.1";
+const APP_VERSION = "5.2";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -593,9 +593,12 @@ function topView() {
   const rs = rooms();
   const onCount = rs.filter((r) => r.on).length;
   let title = "Chauffage";
+  let summary = "";
   if (S.tab === "rooms" && rs.length) {
-    title = onCount === 0 ? "Tout est éteint" : onCount === rs.length ? "Toutes les pièces chauffent" :
-      `${onCount} pièce${onCount > 1 ? "s" : ""} sur ${rs.length} ${onCount > 1 ? "chauffent" : "chauffe"}`;
+    title = "Maison";
+    const ts = rs.filter((r) => r.on && r.temp != null).map((r) => r.temp);
+    const hot = rs.filter((r) => r.on && r.heating).length;
+    summary = onCount === 0 ? "Tout est éteint" : `${ts.length ? deg(ts.reduce((a, b) => a + b, 0) / ts.length) + "° en moyenne · " : ""}${hot ? `${hot} pièce${hot > 1 ? "s chauffent" : " chauffe"}` : "rien ne chauffe"}`;
   } else if (S.tab === "plan") title = "Planning";
   else if (S.tab === "conso") title = "Consommation";
   else if (S.tab === "optim") title = "Optimiser";
@@ -619,7 +622,7 @@ function topView() {
     banners += `<div class="banner info">${I.bag}<div class="b-body"><strong>Mode vacances</strong> jusqu'au ${dateFr(abs.endDate)}.<br><button class="btn" data-act="absence-stop">Arrêter le mode vacances</button></div></div>`;
   }
   const out = S.weather?.now != null ? `<span class="pill">${I.thermo}${esc(cfg.place.name)} ${deg(S.weather.now)}°</span>` : "";
-  return `<header class="top"><div class="status"><h1>${esc(title)}</h1><p class="muted">${out}<span>${sub}</span></p></div>
+  return `<header class="top"><div class="status"><h1>${esc(title)}</h1>${summary ? `<p class="summary">${esc(summary)}</p>` : ""}<p class="muted">${out}<span>${sub}</span></p></div>
     <button class="iconbtn${S.loading ? " spin" : ""}" id="refresh" data-act="refresh" aria-label="Actualiser">${I.refresh}</button>
     <button class="iconbtn" data-act="settings" aria-label="Réglages">${I.gear}</button></header>${banners}`;
 }
@@ -631,29 +634,91 @@ function navView() {
 
 function heatPct(t) { if (t == null) return 30; return Math.round(Math.min(100, Math.max(0, (t - 15) / 7 * 100))); }
 
+// Niveau du programme en ce moment, et prochain changement de niveau
+function curLevel(r) { const { day, min } = nowParts(); return levelAt(r, day, min); }
+function nextDiff(r) {
+  const { day, min } = nowParts();
+  const cur = levelAt(r, day, min);
+  for (let k = 0; k < 7; k++) {
+    const di = (day + k) % 7;
+    for (const p of r.week[di]) if ((k > 0 || p.min > min) && p.level !== cur) return { day: di, min: p.min, level: p.level, k };
+  }
+  return null;
+}
+const whenTxt = (nx) => nx.k === 0 ? `à ${hhmm(nx.min)}` : nx.k === 1 ? `demain à ${hhmm(nx.min)}` : `${DAYS[nx.day].toLowerCase()} à ${hhmm(nx.min)}`;
+const isConstant = (r) => r.hasSchedule && !r.week.some((d) => d.some((p) => p.level === 1)) && Math.abs((r.levels[2] ?? 0) - (r.levels[3] ?? 1)) < 0.01;
+function levelColor(r) {
+  if (!r.on) return "var(--ink-2)";
+  if (r.override || !r.prog) return r.target >= (r.levels[1] ?? 19) - 0.3 ? "var(--confort)" : "var(--eco)";
+  return LEVELS[curLevel(r)]?.color || "var(--eco)";
+}
+function roomLine(r) {
+  if (!r.available) return "Injoignable";
+  if (!r.on) return "Éteint";
+  if (workActive(r)) return `${r.heating ? "Vers" : "À"} ${deg(r.target)}° · télétravail`;
+  if (r.override) return `${deg(r.target)}° · dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}`;
+  if (!r.prog) return `Manuel · ${deg(r.target)}°`;
+  if (isConstant(r)) return `Constant ${deg(r.target)}°`;
+  const l = curLevel(r), nx = nextDiff(r);
+  return `${LEVELS[l]?.label || "Programme"} ${deg(r.target)}°${nx ? ` · ${LEVELS[nx.level].label.toLowerCase()} ${whenTxt(nx)}` : ""}`;
+}
+const GAUGE = [14, 24];
+const gaugePct = (v) => Math.round(Math.min(1, Math.max(0, ((v ?? GAUGE[0]) - GAUGE[0]) / (GAUGE[1] - GAUGE[0]))) * 100);
+
 function roomsView() {
   const rs = rooms();
   if (!rs.length) return `<div class="empty">${S.error ? "Impossible de lire tes radiateurs pour l'instant." : "Chargement de tes pièces…"}</div>`;
+  if (!S.hist && !S.histError) loadHistory();
   const pend = pendingRoomIds();
   const work = rs.find((r) => r.name.toLowerCase() === String(cfg.work.room).toLowerCase());
-  const scenes = `<div class="scenes${work ? "" : " three"}" role="group" aria-label="Scènes">
-    <button class="scene" data-act="all-on">${I.power}<span>Tout allumer</span></button>
+  const workOn = workActive(work);
+  const endAt = workOn && work.overrideLeft ? new Date(Date.now() + work.overrideLeft * 60000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
+  const scenes = `<div class="scenes" role="group" aria-label="Scènes">
+    ${work ? `<button class="scene${workOn ? " on" : ""}" data-act="work" aria-pressed="${workOn}">${I.laptop}<span>${workOn ? `Télétravail${endAt ? " · " + endAt : ""}` : "Télétravail"}</span></button>` : ""}
     <button class="scene" data-act="all-off">${I.moon}<span>Tout éteindre</span></button>
-    ${work ? `<button class="scene${workActive(work) ? " on" : ""}" data-act="work" aria-pressed="${workActive(work)}">${I.laptop}<span>${workActive(work) ? "Télétravail en cours" : "Télétravail"}</span></button>` : ""}
-    <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button></div>`;
+    <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button>
+    <button class="scene" data-act="all-on">${I.power}<span>Tout allumer</span></button></div>`;
   const tiles = rs.map((r) => {
-    const mode = !r.available ? "Injoignable" : !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
     const hasFault = (S.faults || []).some((f) => f.deviceId === r.id && !isAcked(f));
     const badge = pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>'
       : hasFault ? `<span class="badge fault" title="Défaut signalé">${I.warn}</span>`
-      : !r.on ? `<span class="badge">${I.power}</span>` : r.heating ? `<span class="badge hot" title="Chauffe">${I.flame}</span>` : "";
-    return `<button class="tile${r.on ? "" : " off"}" style="--heat:${heatPct(r.temp)}%" data-room="${r.id}" aria-label="${esc(r.name)}, ${r.temp != null ? deg(r.temp) + " degrés" : "température inconnue"}, ${r.on ? "allumé" : "éteint"}">
+      : r.on && r.heating ? `<span class="hotpill">${I.flame}Chauffe</span>` : "";
+    const col = levelColor(r);
+    const gauge = r.on && r.temp != null ? `<span class="gauge" aria-hidden="true"><i style="width:${gaugePct(r.temp)}%;background:${col}"></i>${r.target != null ? `<b style="left:${gaugePct(r.target)}%"></b>` : ""}</span>` : "";
+    return `<button class="tile${r.on ? "" : " off"}" data-room="${r.id}" aria-label="${esc(r.name)}, ${r.temp != null ? deg(r.temp) + " degrés" : "température inconnue"}, ${esc(roomLine(r))}">
       <span class="t-top"><span class="name">${esc(r.name)}</span>${badge}</span>
-      <span class="temp num">${r.temp != null ? deg(r.temp) + "<sup>°</sup>" : `<span class="nodata">–</span>`}</span>
-      <span class="t-foot">${r.on ? `<span class="target num">${I.target}${deg(r.target)}°</span>` : ""}<span class="mode">${esc(mode)}</span></span>
+      <span class="temp num">${r.temp != null ? deg(r.temp) + "°" : `<span class="nodata">–</span>`}</span>
+      ${gauge}
+      <span class="line">${esc(roomLine(r))}</span>
       ${r.temp == null ? `<span class="stale">Mesure ancienne</span>` : nowS() - r.tempAt > 2 * 3600 ? `<span class="stale">Mesuré ${ago(nowS() - r.tempAt)}</span>` : ""}</button>`;
   }).join("");
-  return scenes + `<div class="rooms">${tiles}</div>`;
+  return scenes + `<div class="rooms">${tiles}</div>` + todayView(rs) + savingsNudge();
+}
+// La journée de chaque pièce, d'un coup d'œil
+function todayView(rs) {
+  const list = rs.filter((r) => r.hasSchedule);
+  if (!list.length) return "";
+  const { day, min } = nowParts();
+  const rows = list.map((r) => {
+    let bar;
+    if (!r.on) bar = `<span class="today-bar"><i style="flex:1;background:var(--off)"></i></span>`;
+    else {
+      const segs = []; let cursor = 0, lvl = levelAt(r, day, 0);
+      for (const p of r.week[day]) { if (p.min > cursor) segs.push([cursor, p.min, lvl]); cursor = Math.max(cursor, p.min); lvl = p.level; }
+      segs.push([cursor, 1440, lvl]);
+      bar = `<span class="today-bar">${segs.filter((x) => x[1] > x[0]).map((x) => `<i style="flex:${x[1] - x[0]};background:${LEVELS[x[2]]?.color || "var(--surface-2)"}"></i>`).join("")}</span>`;
+    }
+    return `<span class="today-name">${esc(r.name)}</span><span class="today-cell">${bar}<span class="now-line" style="left:${(min / 14.4).toFixed(1)}%"></span></span>`;
+  }).join("");
+  return `<div class="card"><div class="today-head"><h2 class="sec" style="margin:0">Aujourd'hui</h2><span class="muted">Il est ${hhmm(min)}</span></div>
+    <div class="today">${rows}</div>
+    <div class="legend">${[1, 2, 3].map((k) => `<span><i style="background:${LEVELS[k].color}"></i>${LEVELS[k].label}</span>`).join("")}<span><i style="background:var(--ink);width:2px"></i>Maintenant</span></div></div>`;
+}
+function savingsNudge() {
+  if (!S.hist) return "";
+  const sv = savings();
+  if (sv.mode === "wait") return "";
+  return `<button class="nudge" data-tab="suivi">${I.trend}<span><b>${sv.pct <= 0 ? "−" + -sv.pct : "+" + sv.pct} % ${sv.mode === "optim" ? "depuis le programme optimisé" : "cette semaine"}, à météo égale</b><span class="muted">Voir le suivi</span></span></button>`;
 }
 
 // ---------- Planning
@@ -853,8 +918,9 @@ function proposal(room) {
   if (u === "guest") t[3] = t[2]; // nuit = éco : la pièce reste à température constante
   if (habits.feel === "frileux" && u !== "office") t[1] = Math.min(u === "bath" ? 23 : 21, t[1] + 1);
   if (habits.feel === "frais" && u !== "office") t[1] = Math.max(17, t[1] - 1);
-  // Avance de la montée en confort : nulle si les radiateurs anticipent eux-mêmes, apprise sinon
-  const lead = habits.anticip === "appli" ? (leadFor(room)?.min ?? 30) : 0;
+  // Avance de la montée en confort : apprise de la vitesse de chauffe si l'appli anticipe,
+  // sinon le retard réellement mesuré (radiateur qui n'arrive pas à temps malgré son anticipation)
+  const lead = habits.anticip === "appli" ? (leadFor(room)?.min ?? 30) : extraLead(room);
   const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
   const week = [];
   for (let d = 0; d < 7; d++) {
@@ -880,6 +946,44 @@ function proposal(room) {
   return { usage: u, t, week };
 }
 // Consigne moyenne sur la semaine (pas de 15 min), pour estimer l'effet des changements
+// Confort atteint ou pas, et avec quel retard, depuis la dernière application du programme
+function comfortStats(r) {
+  const comfort = r.levels[1];
+  if (comfort == null || !S.hist?.mesures?.length) return null;
+  const since = habits.applied?.[r.id]?.at || 0;
+  const m = seriesOf(r.name).filter((x) => x.t >= since);
+  const delays = []; let missed = 0, periods = 0, cold = 0;
+  for (let i = 1; i < m.length; i++) {
+    const x = m[i], prev = m[i - 1];
+    if (x.t - prev.t > 25 * 60 || x.target == null || prev.target == null) continue;
+    if (!(x.target >= comfort - 0.1 && prev.target < comfort - 0.5)) continue;
+    let j = i, reached = null, maxT = -99, end = x.t;
+    while (j < m.length && m[j].target != null && m[j].target >= comfort - 0.1 && m[j].t - x.t <= 6 * 3600) {
+      if (m[j].temp != null) { maxT = Math.max(maxT, m[j].temp); if (reached == null && m[j].temp >= m[j].target - 0.3) reached = m[j].t; }
+      end = m[j].t; j++;
+    }
+    if (end - x.t < 45 * 60) continue;
+    periods++;
+    if (reached == null) { missed++; if (maxT < comfort - 1) cold++; delays.push(Math.min(240, (end - x.t) / 60)); }
+    else delays.push((reached - x.t) / 60);
+  }
+  return periods >= 2 ? { delay: median(delays), periods, missed, cold } : null;
+}
+function extraLead(r) {
+  const prev = habits.applied?.[r.id]?.extra || 0;
+  const st = comfortStats(r);
+  const add = st && st.delay > 20 ? Math.ceil(st.delay / 15) * 15 : 0;
+  return Math.min(120, prev + add);
+}
+function roomNotes(r) {
+  const out = [];
+  const st = comfortStats(r);
+  if (st && st.cold >= 2 && st.cold / st.periods >= 0.5) out.push(`<b>Confort jamais atteint</b> : sur ${st.periods} périodes de confort, la pièce est restée ${st.cold} fois à plus d'un degré sous sa consigne. Monter la consigne n'y changera rien : vérifie fenêtre, porte ou puissance du radiateur.`);
+  else if (st && st.delay > 20) out.push(habits.anticip === "appli" ? `La pièce met en moyenne ${duration(st.delay)} à atteindre son confort.` : `La pièce met en moyenne ${duration(st.delay)} à atteindre son confort malgré l'anticipation du radiateur : le programme proposé le démarre plus tôt.`);
+  const facts = roomFacts(r);
+  if (facts.length) out.push(`Mesuré : la pièce ${esc(facts.join(", "))}.`);
+  return out;
+}
 function avgSetpoint(week, temps) {
   const fake = { week };
   let sum = 0, n = 0;
@@ -930,6 +1034,7 @@ function optimView() {
       <div class="chgs">${temps}</div>
       <div class="cmp"><span class="lbl">Semaine</span><span class="tag">Actuel</span>${barHTML(r.week, 0)}<span></span><span class="tag">Proposé</span>${barHTML(prop.week, 0)}
         <span class="lbl">Week-end</span><span class="tag">Actuel</span>${barHTML(r.week, 5)}<span></span><span class="tag">Proposé</span>${barHTML(prop.week, 5)}</div>
+      ${roomNotes(r).map((n) => `<p class="help note">${n}</p>`).join("")}
       <p class="help">${esc(prop.week[0].map((p) => `${hhmm(p.min)} ${LEVELS[p.level].label.toLowerCase()}`).join(", "))} en semaine.${!r.on ? " La pièce est éteinte : ce programme servira quand tu la rallumeras." : ""}</p>
       ${w.length ? `<button class="btn primary block" data-opt-apply="${r.id}">Appliquer à ${esc(r.name)}</button>` : `<p class="help"><b>Déjà appliqué.</b></p>`}
     </div>`;
@@ -937,6 +1042,8 @@ function optimView() {
   return `<div class="card hero-opt"><span class="muted">Économie estimée sur le chauffage</span>
       <b class="num big">${global > 0 ? "−" + global : global < 0 ? "+" + -global : "≈ 0"} %</b>
       <p class="help">Calcul à partir de la consigne moyenne de chaque pièce sur la semaine, avec le repère de l'ADEME : environ 7 % de conso en moins par degré. C'est un ordre de grandeur, la conso réelle tranchera.</p>
+      ${(() => { if (!S.hist) return ""; const sv = savings(); return sv.mode === "optim" ? `<p class="measured"><b>Mesuré : ${sv.pct <= 0 ? "−" + -sv.pct : "+" + sv.pct} %</b> à météo égale depuis le ${new Date(cfg.optimAt + "T12:00").toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}.</p>`
+        : cfg.optimAt ? `<p class="help">L'économie réelle s'affichera ici après quelques jours de chauffage, mesurée à météo égale.</p>` : ""; })()}
       <button class="btn" data-act="habits-edit">Modifier mes habitudes</button></div>
     ${cards}
     ${leversView()}`;
@@ -1001,7 +1108,7 @@ async function loadHistory(force = false) {
   try { S.hist = await api("history&days=14"); S.histAt = Date.now(); S.histError = null; }
   catch (e) { S.histError = e.message; }
   S.histLoading = false;
-  if (S.tab === "suivi" || S.tab === "optim") render();
+  if (S.tab === "suivi" || S.tab === "optim" || S.tab === "rooms") render();
 }
 
 // Relevés d'une pièce, triés, en secondes
@@ -1170,14 +1277,14 @@ function dataAdvice() {
 }
 
 // Graphique des températures sur 48 h
-function tempChart(name) {
-  const since = Date.now() / 1000 - 48 * 3600;
+function tempChart(name, hours = 48) {
+  const since = Date.now() / 1000 - hours * 3600;
   const m = seriesOf(name).filter((x) => x.t >= since);
   if (m.length < 4) return `<p class="help">Pas encore assez de relevés pour cette pièce. Le premier graphique apparaît après quelques heures.</p>`;
   const W_ = 320, H = 150, padL = 26, padB = 18, padT = 8;
   const vals = m.flatMap((x) => [x.temp, x.target, x.outdoor]).filter((v) => v != null);
   const lo = Math.floor(Math.min(...vals) - 1), hi = Math.ceil(Math.max(...vals) + 1);
-  const X = (t) => padL + (t - since) / (48 * 3600) * (W_ - padL);
+  const X = (t) => padL + (t - since) / (hours * 3600) * (W_ - padL);
   const Y = (v) => padT + (hi - v) / (hi - lo) * (H - padB - padT);
   const line = (k, step) => {
     let d = "", prev = null;
@@ -1196,10 +1303,10 @@ function tempChart(name) {
   const d0 = new Date(since * 1000); d0.setMinutes(0, 0, 0);
   for (let t = d0.getTime() / 1000 + 3600; t < Date.now() / 1000; t += 3600) {
     const h = new Date(t * 1000).getHours();
-    if (h % 12 === 0) ticks.push(`<line x1="${X(t)}" x2="${X(t)}" y1="${padT}" y2="${H - padB}" stroke="var(--line)" stroke-dasharray="2 3"/><text x="${X(t)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="var(--ink-2)">${h === 0 ? new Date(t * 1000).toLocaleDateString("fr-FR", { weekday: "short" }) : "12 h"}</text>`);
+    if (h % (hours > 24 ? 12 : 6) === 0) ticks.push(`<line x1="${X(t)}" x2="${X(t)}" y1="${padT}" y2="${H - padB}" stroke="var(--line)" stroke-dasharray="2 3"/><text x="${X(t)}" y="${H - 5}" text-anchor="middle" font-size="9" fill="var(--ink-2)">${h === 0 ? new Date(t * 1000).toLocaleDateString("fr-FR", { weekday: "short" }) : h + " h"}</text>`);
   }
   return `<div class="legend"><span><i style="background:var(--accent)"></i>Pièce</span><span><i style="background:var(--ink-2)"></i>Consigne</span><span><i style="background:var(--ink-3, #9AA5AE)"></i>Dehors</span><span><i style="background:var(--hp)"></i>Chauffe</span></div>
-    <div class="chart"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Températures de ${esc(name)} sur 48 heures">${grid.join("")}${ticks.join("")}${heat}
+    <div class="chart"><svg viewBox="0 0 ${W_} ${H}" role="img" aria-label="Températures de ${esc(name)} sur ${hours} heures">${grid.join("")}${ticks.join("")}${heat}
       <path d="${line("outdoor")}" fill="none" stroke="var(--ink-3, #9AA5AE)" stroke-width="1.2" stroke-dasharray="1 3" stroke-linecap="round"/>
       <path d="${line("target", true)}" fill="none" stroke="var(--ink-2)" stroke-width="1.5" stroke-dasharray="4 3"/>
       <path d="${line("temp")}" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linejoin="round"/></svg></div>`;
@@ -1349,26 +1456,68 @@ function closeSheet(instant) {
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
 
 // Fiche d'une pièce
+const DIAL = [12, 24];
+function dialSVG(r, t) {
+  const f = (v) => Math.min(1, Math.max(0, (v - DIAL[0]) / (DIAL[1] - DIAL[0])));
+  const pt = (v) => { const a = (135 + f(v) * 270) * Math.PI / 180; return [140 + 110 * Math.cos(a), 140 + 110 * Math.sin(a)]; };
+  const [sx, sy] = pt(DIAL[0]), [ex, ey] = pt(DIAL[1]), [tx, ty] = pt(t);
+  const col = t >= (r.levels[1] ?? 19) - 0.3 ? "var(--confort)" : t <= (r.levels[3] ?? 0) + 0.3 && (r.levels[3] ?? 0) < (r.levels[2] ?? 0) ? "var(--nuit)" : "var(--eco)";
+  const cur = r.temp != null ? pt(r.temp) : null;
+  return `<svg viewBox="0 0 280 280" role="img" aria-label="Consigne ${deg(t)} degrés${r.temp != null ? `, il fait ${deg(r.temp)} degrés` : ""}">
+    <path d="M${sx.toFixed(1)} ${sy.toFixed(1)}A110 110 0 1 1 ${ex.toFixed(1)} ${ey.toFixed(1)}" fill="none" stroke="var(--surface-2)" stroke-width="22" stroke-linecap="round"/>
+    ${f(t) > 0.005 ? `<path d="M${sx.toFixed(1)} ${sy.toFixed(1)}A110 110 0 ${f(t) * 270 > 180 ? 1 : 0} 1 ${tx.toFixed(1)} ${ty.toFixed(1)}" fill="none" stroke="${col}" stroke-width="22" stroke-linecap="round"/>` : ""}
+    ${cur ? `<circle cx="${cur[0].toFixed(1)}" cy="${cur[1].toFixed(1)}" r="7" fill="var(--ink)"/>` : ""}
+    <circle cx="${tx.toFixed(1)}" cy="${ty.toFixed(1)}" r="16" fill="var(--surface)" stroke="${col}" stroke-width="6"/></svg>`;
+}
+// Minutes jusqu'au prochain lever (pour « Nuit maintenant »), à l'heure près, entre 1 et 12 h
+function minutesToWake() {
+  const now = new Date();
+  const tomorrow = (now.getDay() + 7) % 7; // 0 = dimanche
+  const weekendTomorrow = tomorrow === 5 || tomorrow === 6; // demain samedi ou dimanche
+  const wake = toMin(weekendTomorrow ? habits.weekend.wake : habits.week.wake);
+  let m = wake + 1440 - (now.getHours() * 60 + now.getMinutes());
+  if (m > 1440) m -= 1440;
+  return Math.min(720, Math.max(60, Math.round(m / 60) * 60));
+}
+function roomFacts(r) {
+  const out = [];
+  const d = dutyOf(r.name);
+  if (d) out.push(`chauffe ${nf1.format(d.hours)} h par jour, environ ${nf1.format(d.hours * (r.watts || 1000) / 1000)} kWh`);
+  const h = heatRate(r.name);
+  if (h) out.push(`monte de ${nf1.format(h.rate)}° par heure`);
+  return out;
+}
 function openRoom(id) {
   let pendingTarget = null, timer = null;
   const draw = () => {
     const r = roomById(id); if (!r) return "";
-    const t = pendingTarget ?? r.target;
-    const nx = r.prog && !r.override ? nextChange(r) : null;
-    return `<h3>${esc(r.name)}</h3><p class="muted" style="margin:0">${esc(r.model)}${r.watts ? `, ${r.watts} W` : ""}</p>
-      <div class="big-temp"><span class="now">${r.temp != null ? deg(r.temp) + "°" : "–"}</span><span class="muted">${r.temp != null ? `dans la pièce<br>mesuré ${ago(nowS() - r.tempAt)}` : r.lastTemp != null && r.tempAt ? `pas de mesure récente<br>dernière : ${deg(r.lastTemp)}° ${ago(nowS() - r.tempAt)}` : "le radiateur n'envoie pas<br>sa température en ce moment"}</span></div>
-      <div class="switch"><span>${r.on ? "Allumé" : "Éteint"}</span><button class="toggle" role="switch" aria-checked="${r.on}" aria-label="Allumer ou éteindre" data-r="power"></button></div>
+    const t = pendingTarget ?? r.target ?? 19;
+    const nx = r.prog && !r.override ? nextDiff(r) : null;
+    const mode = !r.available ? "injoignable" : !r.on ? "éteint" : r.override ? "dérogation" : r.prog ? "en programme" : "en manuel";
+    const since = Date.now() / 1000 - 24 * 3600;
+    const m24 = seriesOf(r.name).filter((x) => x.t >= since);
+    const heated = m24.length > 8 ? m24.filter((x) => x.heating).length * 15 : null;
+    const facts = roomFacts(r);
+    let next = "";
+    if (r.on && r.override) next = `Dérogation${r.overrideLeft ? `, encore ${duration(r.overrideLeft)}` : ""}, puis retour au programme.`;
+    else if (nx) next = `${LEVELS[curLevel(r)]?.label || "Programme"} jusqu'à ${hhmm(nx.min)}${nx.k ? (nx.k === 1 ? " demain" : " " + DAYS[nx.day].toLowerCase()) : ""}, puis ${LEVELS[nx.level].label.toLowerCase()} à ${deg(r.levels[nx.level])}°.`;
+    else if (r.on && !r.prog) next = "En manuel : la consigne reste fixe.";
+    return `<div class="fiche-head"><div><h3>${esc(r.name)}</h3><p class="muted" style="margin:0">${esc(r.model)}${r.watts && !/\d\s*W\b/i.test(r.model) ? ` ${r.watts} W` : ""} · ${mode}</p></div>
+        <button class="powerpill${r.on ? " on" : ""}" data-r="power" aria-pressed="${r.on}">${I.power}${r.on ? "Allumé" : "Éteint"}</button></div>
       ${r.on ? `
-      <div class="stepper"><button data-r="minus" aria-label="Baisser la consigne">−</button>
-        <div class="val"><b class="num">${deg(t)}°</b><span class="muted">${pendingTarget != null ? "envoi dans un instant…" : r.override ? `dérogation, encore ${duration(r.overrideLeft || r.overrideTotal)}` : "consigne"}</span></div>
-        <button data-r="plus" aria-label="Monter la consigne">+</button></div>
-      ${r.prog && !r.override ? `<p class="help">En programme, changer la consigne crée une dérogation de ${duration(r.overrideTotal)}, puis le programme reprend.</p>` : ""}
+      <div class="dial-row"><button class="round" data-r="minus" aria-label="Baisser la consigne">−</button>
+        <div class="dial">${dialSVG(r, t)}<div class="dial-c"><span class="muted"><b>${pendingTarget != null ? "Envoi…" : "Consigne"}</b></span><b class="num">${deg(t)}°</b><span class="muted">${r.temp != null ? `il fait ${deg(r.temp)}°` : r.lastTemp != null ? `dernière mesure ${deg(r.lastTemp)}°` : "température inconnue"}</span></div></div>
+        <button class="round" data-r="plus" aria-label="Monter la consigne">+</button></div>
+      ${next ? `<p class="help center">${esc(next)}</p>` : ""}
+      ${r.prog && !r.override ? `<p class="help center">Changer la consigne crée une dérogation de ${duration(r.overrideTotal)}.</p>` : ""}
       <div class="seg" role="group" aria-label="Mode"><button aria-pressed="${!r.prog}" data-r="manual">Manuel</button><button aria-pressed="${r.prog}" data-r="prog">Programme</button></div>
-      ${nx ? `<p class="help">Programme : passe en ${LEVELS[nx.level]?.label.toLowerCase()} (${deg(r.levels[nx.level])}°) à ${hhmm(nx.min)}${nx.k ? (nx.k === 1 ? " demain" : " " + DAYS[nx.day].toLowerCase()) : ""}.</p>` : ""}
-      ${r.override ? `<button class="btn block" data-r="cancel-override">Reprendre le programme maintenant</button><p></p>` : ""}
-      <button class="btn primary block" data-r="boost">${I.boost}Coup de chaud : +${cfg.boost.delta}° pendant ${duration(cfg.boost.minutes)}</button>
-      ` : `<p class="help">Éteint depuis ${r.powerAt ? dateFr(r.powerAt) : "un moment"}.</p>`}
-      <p></p><button class="btn block" data-r="planning">Voir le planning</button>`;
+      <div class="quick">
+        <button class="q warm" data-r="boost"><b>Coup de chaud</b><span>+${deg(cfg.boost.delta)}° pendant ${duration(cfg.boost.minutes)}</span></button>
+        ${r.override ? `<button class="q" data-r="cancel-override"><b>Reprendre</b><span>le programme maintenant</span></button>`
+          : `<button class="q night" data-r="night"><b>Nuit maintenant</b><span>${deg(r.levels[3] ?? 17)}° jusqu'au lever</span></button>`}
+      </div>` : `<p class="help">Éteint depuis ${r.powerAt ? dateFr(r.powerAt) : "un moment"}. Touche « Éteint » pour le rallumer.</p>`}
+      ${m24.length >= 4 ? `<div class="card flat"><div class="today-head"><b>Dernières 24 h</b>${heated != null ? `<span class="muted">a chauffé ${duration(heated)}</span>` : ""}</div>${tempChart(r.name, 24)}${facts.length ? `<p class="help">En moyenne, la pièce ${esc(facts.join(", "))}.</p>` : ""}</div>` : ""}
+      <button class="btn block" data-r="planning">Voir le planning</button>`;
   };
   const rebind = (el) => {
     el.querySelectorAll("[data-r]").forEach((b) => b.addEventListener("click", () => act(b.dataset.r)));
@@ -1395,6 +1544,10 @@ function openRoom(id) {
     if (a === "boost") {
       const t = clampT(r, Math.max(r.target ?? 19, r.temp ?? 0) + cfg.boost.delta);
       runJob(`${r.name} : ${deg(t)}° pendant ${duration(cfg.boost.minutes)}`, writesOverride(r, t, cfg.boost.minutes));
+    }
+    if (a === "night") {
+      const t = clampT(r, r.levels[3] ?? 17), minutes = minutesToWake();
+      runJob(`${r.name} : nuit à ${deg(t)}° pendant ${duration(minutes)}`, writesOverride(r, t, minutes));
     }
     if (a === "planning") { S.planRoom = id; setTab("plan"); closeSheet(); }
   };
@@ -1624,6 +1777,8 @@ document.addEventListener("click", (e) => {
     const r = roomById(+t.dataset.optApply); const prop = proposal(r);
     if (r && prop && confirm(`Envoyer le programme proposé à ${r.name} ?`)) {
       runJob(`${r.name} : programme optimisé`, writesProposal(r, prop));
+      habits.applied = { ...(habits.applied || {}), [r.id]: { at: nowS(), extra: habits.anticip === "appli" ? 0 : extraLead(r) } };
+      store.set("habits", habits);
       if (!cfg.optimAt) { cfg.optimAt = dayKey(nowS()); store.set("cfg", cfg); } // point de départ de la mesure des économies
     }
     return;
