@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "4.5";
+const APP_VERSION = "4.7";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -281,11 +281,14 @@ async function loadFaults(force = false) {
   try { const d = await api("faults"); S.faults = d.faults || []; render(); }
   catch { faultsAt = 0; /* relais pas encore à jour : on réessaiera */ }
 }
+let faultAcks = store.get("faultAcks", []);
+const faultKey = (f) => `${f.name}|${f.code}`;
+const isAcked = (f) => faultAcks.includes(faultKey(f)) || (S.faults || []).some((g) => g.code === f.code && faultAcks.includes(faultKey(g)));
 // La CozyBox recopie souvent le défaut d'un radiateur : on n'affiche qu'une fois chaque code
 function faultsList() {
   const seen = new Set();
   const list = [...(S.faults || [])].sort((a, b) => (rooms().some((r) => r.id === b.deviceId) ? 1 : 0) - (rooms().some((r) => r.id === a.deviceId) ? 1 : 0));
-  return list.filter((f) => { const k = f.code; if (seen.has(k)) return false; seen.add(k); return true; })
+  return list.filter((f) => !isAcked(f)).filter((f) => { const k = f.code; if (seen.has(k)) return false; seen.add(k); return true; })
     .map((f) => ({ ...f, room: rooms().find((r) => r.id === f.deviceId) }));
 }
 
@@ -452,9 +455,25 @@ async function runJob(label, writes, done) {
       await refresh({ quiet: true });
       if (verify(writes)) { job.status = "done"; job.detail = "Appliqué"; break; }
     }
+    // Réglages non pris : on les renvoie seuls, une fois, en douceur
+    if (job.status !== "done") {
+      const missing = writes.filter((w) => !verify([w]));
+      if (missing.length && missing.length < writes.length + 1) {
+        job.detail = `Nouvel essai pour ${missing.length} réglage${missing.length > 1 ? "s" : ""}…`; renderJobs();
+        await sleep(5000);
+        try { await api("write", "POST", { writes: missing }); } catch { /* vérifié juste après */ }
+        for (const wait of [5000, 15000]) {
+          await sleep(wait);
+          await refresh({ quiet: true });
+          if (verify(writes)) { job.status = "done"; job.detail = "Appliqué (après un nouvel essai)"; break; }
+        }
+        if (job.status !== "done") job.writes = writes.filter((w) => !verify([w]));
+      }
+    }
     if (job.status !== "done") {
       job.status = "unconfirmed";
-      job.detail = "Cozytouch a dit OK mais les radiateurs n'ont pas appliqué. Si ça se répète, redémarre la CozyBox.";
+      const what = job.writes.map((w) => CAP_LABEL[w.capabilityId] || `réglage ${w.capabilityId}`).join(", ");
+      job.detail = `Pas encore appliqué : ${what}. Touche Réessayer pour renvoyer seulement ces réglages.`;
     }
   } catch (e) {
     job.status = "failed"; job.detail = e.message;
@@ -537,7 +556,8 @@ function topView() {
   if (S.tab === "rooms") for (const f of faultsList()) {
     banners += `<div class="banner alert">${I.warn}<div class="b-body"><strong>${esc(f.room?.name || f.name)} : défaut ${esc(f.code)}</strong>${f.since ? ` depuis le ${new Date(f.since * 1000).toLocaleDateString("fr-FR", { day: "numeric", month: "long" })}` : ""}.
       ${f.label ? `<br>${esc(f.label)}` : ""}${f.cause ? `<br><span class="muted">Cause probable : ${esc(f.cause)}</span>` : ""}${f.repair ? `<br><span class="muted">Que faire : ${esc(f.repair)}</span>` : ""}
-      ${!f.label ? `<br><span class="muted">Coupe le radiateur au disjoncteur une minute puis rallume-le. Si le défaut revient, signale ce code au service client Atlantic.</span>` : ""}</div></div>`;
+      ${!f.label ? `<br><span class="muted">Coupe le radiateur au disjoncteur une minute puis rallume-le. Si le défaut revient, signale ce code au service client Atlantic.</span>` : ""}
+      <br><button class="btn" data-fault-ack="${esc(faultKey(f))}">Masquer ce défaut</button></div></div>`;
   }
   const abs = S.setup?.absence;
   if (abs?.startDate && abs?.endDate && abs.endDate > nowS()) {
@@ -567,8 +587,8 @@ function roomsView() {
     ${work ? `<button class="scene${workActive(work) ? " on" : ""}" data-act="work" aria-pressed="${workActive(work)}">${I.laptop}<span>${workActive(work) ? "Télétravail en cours" : "Télétravail"}</span></button>` : ""}
     <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button></div>`;
   const tiles = rs.map((r) => {
-    const mode = !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
-    const hasFault = (S.faults || []).some((f) => f.deviceId === r.id);
+    const mode = r.dev.isAvailable === false ? "Injoignable" : !r.on ? "Éteint" : r.override ? `Dérogation${r.overrideLeft ? " " + duration(r.overrideLeft) : ""}` : r.prog ? "Programme" : "Manuel";
+    const hasFault = (S.faults || []).some((f) => f.deviceId === r.id && !isAcked(f));
     const badge = pend.has(r.id) ? '<span class="pend" aria-hidden="true"></span>'
       : hasFault ? `<span class="badge fault" title="Défaut signalé">${I.warn}</span>`
       : !r.on ? `<span class="badge">${I.power}</span>` : r.heating ? `<span class="badge hot" title="Chauffe">${I.flame}</span>` : "";
@@ -1170,7 +1190,7 @@ function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0
 
 document.addEventListener("click", (e) => {
   if (sheetEl && sheetEl.contains(e.target)) return;
-  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel]");
+  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel],[data-fault-ack]");
   if (!t) return;
   if (t.dataset.tab) return setTab(t.dataset.tab);
   if (t.dataset.room) return openRoom(+t.dataset.room);
@@ -1182,6 +1202,12 @@ document.addEventListener("click", (e) => {
   if (t.dataset.optApply) {
     const r = roomById(+t.dataset.optApply); const prop = proposal(r);
     if (r && prop && confirm(`Envoyer le programme proposé à ${r.name} ?`)) runJob(`${r.name} : programme optimisé`, writesProposal(r, prop));
+    return;
+  }
+  if (t.dataset.faultAck) {
+    if (confirm("Masquer ce défaut ? Il ne réapparaîtra que si un nouveau code arrive.")) {
+      faultAcks = [...new Set([...faultAcks, t.dataset.faultAck])]; store.set("faultAcks", faultAcks); render();
+    }
     return;
   }
   if (t.dataset.feel) { document.querySelectorAll("[data-feel]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
