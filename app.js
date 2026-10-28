@@ -18,7 +18,7 @@ const LEVELS = {
   3: { key: "night", label: "Nuit", cap: C.NIGHT_T, color: "var(--nuit)" },
 };
 const ON = "4", OFF = "0";
-const APP_VERSION = "5.2";
+const APP_VERSION = "5.3";
 
 // ---------- Icônes (traits simples)
 const I = {
@@ -40,6 +40,7 @@ const I = {
   leaf: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19c0-8 5-13 15-14-1 10-6 15-14 15"/><path d="M5 19l7-7"/></svg>',
   target: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
   thermo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 14V5a2 2 0 1 1 4 0v9a4 4 0 1 1-4 0z"/></svg>',
+  bed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18V7M3 14h18v4M21 14v-2a3 3 0 0 0-3-3h-7v5"/><circle cx="7" cy="11" r="2"/></svg>',
   trend: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/></svg>',
   bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10 21a2 2 0 0 0 4 0"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
@@ -675,6 +676,7 @@ function roomsView() {
   const endAt = workOn && work.overrideLeft ? new Date(Date.now() + work.overrideLeft * 60000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }) : "";
   const scenes = `<div class="scenes" role="group" aria-label="Scènes">
     ${work ? `<button class="scene${workOn ? " on" : ""}" data-act="work" aria-pressed="${workOn}">${I.laptop}<span>${workOn ? `Télétravail${endAt ? " · " + endAt : ""}` : "Télétravail"}</span></button>` : ""}
+    ${(() => { const g = guestPair(); if (!g) return ""; const on = guestModeOn(g); return `<button class="scene${on ? " on" : ""}" data-act="guests" aria-pressed="${on}">${I.bed}<span>${on ? "Invités, comme la chambre" : "Invités"}</span></button>`; })()}
     <button class="scene" data-act="all-off">${I.moon}<span>Tout éteindre</span></button>
     <button class="scene" data-act="vacation">${I.bag}<span>Vacances</span></button>
     <button class="scene" data-act="all-on">${I.power}<span>Tout allumer</span></button></div>`;
@@ -695,6 +697,40 @@ function roomsView() {
   return scenes + `<div class="rooms">${tiles}</div>` + todayView(rs) + savingsNudge();
 }
 // La journée de chaque pièce, d'un coup d'œil
+// Mode invités : la chambre d'amis prend le programme et les températures de la chambre
+function guestPair() {
+  const rs = rooms().filter((r) => r.hasSchedule);
+  const guest = rs.find((r) => usageOf(r) === "guest"), bed = rs.find((r) => usageOf(r) === "bedroom");
+  return guest && bed ? { guest, bed } : null;
+}
+function guestModeOn({ guest, bed }) {
+  return guest.on && DAY_IDS.every((cap, k) => sameValue(cap, guest.weekRaw[k], serializeDay(bed.week[k]))) &&
+    [1, 2, 3].every((k) => Math.abs((guest.levels[k] ?? -1) - (bed.levels[k] ?? -2)) < 0.01);
+}
+function writesGuestMode(g, on) {
+  const { guest, bed } = g;
+  const w = [];
+  if (on) {
+    store.set("guestSnapshot", { levelsRaw: guest.levelsRaw, week: guest.week });
+    if (!guest.on) w.push(...writesPower(guest, true));
+    for (const k of [1, 2, 3]) {
+      let second = 0; try { second = JSON.parse(guest.levelsRaw[k])[1] ?? 0; } catch { /* rien */ }
+      const val = JSON.stringify([bed.levels[k], second]);
+      if (!sameValue(LEVELS[k].cap, guest.levelsRaw[k], val)) w.push(W(guest, LEVELS[k].cap, val));
+    }
+    DAY_IDS.forEach((cap, k) => { const v = serializeDay(bed.week[k]); if (!sameValue(cap, guest.weekRaw[k], v)) w.push(W(guest, cap, v)); });
+    if (!guest.prog) w.push(W(guest, C.PROG, "1"));
+    return w;
+  }
+  // Retour au programme habituel : celui de l'Optimiser, sinon l'état d'avant
+  const prop = proposal(guest);
+  if (prop) return writesProposal(guest, prop);
+  const snap = store.get("guestSnapshot", null);
+  if (!snap) return [];
+  for (const k of [1, 2, 3]) if (snap.levelsRaw[k] && !sameValue(LEVELS[k].cap, guest.levelsRaw[k], snap.levelsRaw[k])) w.push(W(guest, LEVELS[k].cap, snap.levelsRaw[k]));
+  DAY_IDS.forEach((cap, k) => { const v = serializeDay(snap.week[k]); if (!sameValue(cap, guest.weekRaw[k], v)) w.push(W(guest, cap, v)); });
+  return w;
+}
 function todayView(rs) {
   const list = rs.filter((r) => r.hasSchedule);
   if (!list.length) return "";
@@ -899,9 +935,12 @@ function guessUsage(name) {
 }
 function defaultHabits() {
   return { week: { wake: "07:00", leave: "08:30", back: "18:30", bed: "23:00" }, weekend: { wake: "08:30", bed: "23:30", out: false },
-    tt: [false, false, false, false, false], feel: "normal", usage: {}, anticip: "radiateur", done: false };
+    tt: [false, false, false, false, false], feel: "normal", usage: {}, anticip: "radiateur", done: false,
+    hcPriority: true, bath: { wk: "06:00", wkEnd: "09:30", we: "08:30", eve: "22:00", eveEnd: "23:30" }, bedroomT: 18, guestT: 16 };
 }
 let habits = Object.assign(defaultHabits(), store.get("habits", {}));
+habits.bath = Object.assign({}, defaultHabits().bath, habits.bath);
+if (habits.hcPriority == null) habits.hcPriority = true;
 const usageOf = (r) => habits.usage[r.id] || guessUsage(r.name);
 
 function cleanPoints(pts) {
@@ -921,6 +960,7 @@ function proposal(room) {
   // Avance de la montée en confort : apprise de la vitesse de chauffe si l'appli anticipe,
   // sinon le retard réellement mesuré (radiateur qui n'arrive pas à temps malgré son anticipation)
   const lead = habits.anticip === "appli" ? (leadFor(room)?.min ?? 30) : extraLead(room);
+  if (habits.hcPriority && ["bath", "bedroom", "guest", "office"].includes(u)) return proposalHC(room, u, lead);
   const morningHC = parseHC(cfg.hc).filter(([, e]) => e < 11 * 60).map(([, e]) => e);
   const week = [];
   for (let d = 0; d < 7; d++) {
@@ -944,6 +984,68 @@ function proposal(room) {
     week.push(cleanPoints(p));
   }
   return { usage: u, t, week };
+}
+// Priorité heures creuses : on chauffe plus quand le kWh est moins cher, et on laisse
+// la pièce redescendre doucement plutôt que de la maintenir en heures pleines
+function hcWindows() {
+  // plages arrondies vers l'intérieur au quart d'heure, pour ne jamais déborder en heures pleines
+  return parseHC(cfg.hc).map(([a, b]) => [Math.ceil(a / 15) * 15, Math.floor(b / 15) * 15]).filter(([a, b]) => b > a);
+}
+function proposalHC(room, u, lead) {
+  const win = hcWindows();
+  const morning = win.find(([a, b]) => a < 9 * 60 && b <= 12 * 60) || [75, 420];
+  const week = [];
+  let t;
+  if (u === "bath") {
+    // 3 niveaux : confort pour l'usage, éco = maintien doux après la fin des heures creuses, nuit = le reste du temps
+    t = { 1: 22, 2: 20, 3: 17 };
+    if (habits.feel === "frileux") t[1] = 23;
+    const b = habits.bath;
+    for (let d = 0; d < 7; d++) {
+      const we = d >= 5;
+      const p = [];
+      const start = toMin(we ? b.we : b.wk) - lead;
+      if (!we && start < morning[1]) {
+        // passage du matin en heures creuses, puis maintien doux jusqu'à la fin des passages du matin
+        p.push({ min: start, level: 1 }, { min: morning[1], level: 2 }, { min: toMin(b.wkEnd), level: 3 });
+      } else {
+        p.push({ min: start, level: 1 }, { min: start + lead + 60, level: 3 });
+      }
+      // soir : confort à l'arrivée, coupé 30 min avant la fin (la pièce reste tiède)
+      p.push({ min: toMin(b.eve) - lead, level: 1 }, { min: toMin(b.eveEnd) - 30, level: 3 });
+      week.push(cleanPoints(p));
+    }
+    return { usage: u, t, week, hc: true };
+  }
+  if (u === "bedroom") {
+    // nuit au chaud (surtout en heures creuses), journée en éco
+    const T = habits.bedroomT || 18;
+    t = { 1: T, 2: Math.max(15, T - 2), 3: T };
+    for (let d = 0; d < 7; d++) {
+      const we = d >= 5;
+      const wake = toMin(we ? habits.weekend.wake : habits.week.wake);
+      const bed = toMin(we ? habits.weekend.bed : habits.week.bed);
+      const off = wake <= morning[1] ? morning[1] : wake + 30; // on garde le chaud jusqu'à la fin des heures creuses, ou jusqu'au lever
+      week.push(cleanPoints([{ min: off, level: 2 }, { min: bed - 30 - lead, level: 1 }]));
+    }
+    return { usage: u, t, week, hc: true };
+  }
+  // Bureau et chambre d'amis : une base, +1° pendant les heures creuses
+  const pts = (lo, hi) => cleanPoints(win.flatMap(([a, b]) => [{ min: a, level: hi }, { min: b, level: lo }]));
+  if (u === "guest") {
+    const B = habits.guestT || 16;
+    t = { 1: habits.bedroomT || 18, 2: B, 3: B + 1 };
+    for (let d = 0; d < 7; d++) week.push(pts(2, 3));
+    return { usage: u, t, week, hc: true };
+  }
+  // Bureau : base de la semaine (réglages) et +1° en heures creuses ; le week-end comme la chambre d'amis
+  const base = cfg.work.base ?? 17, gB = habits.guestT || 16;
+  t = { 1: base + 1, 2: base, 3: gB };
+  for (let d = 0; d < 7; d++) {
+    if (d < 5) week.push(pts(2, 1));
+    else week.push(pts(3, 2)); // week-end comme la chambre d'amis : 16°, et la base de la semaine en heures creuses
+  }
+  return { usage: u, t, week, hc: true };
 }
 // Consigne moyenne sur la semaine (pas de 15 min), pour estimer l'effet des changements
 // Confort atteint ou pas, et avec quel retard, depuis la dernière application du programme
@@ -1072,6 +1174,13 @@ function habitsForm(rs) {
       <label class="daypick"><label><input type="checkbox" id="h-out" ${h.weekend.out ? "checked" : ""}>Souvent dehors la journée</label></label></div>
     <div class="card"><h2 class="sec" style="margin-top:0">Ton ressenti</h2>
       <div class="seg" role="group">${[["frileux", "Frileux"], ["normal", "Normal"], ["frais", "J'aime le frais"]].map(([v, l]) => `<button type="button" aria-pressed="${h.feel === v}" data-feel="${v}">${l}</button>`).join("")}</div></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">Priorité heures creuses</h2>
+      <div class="switch"><span>Chauffer surtout pendant les heures creuses</span><button type="button" class="toggle" role="switch" id="h-hc" aria-checked="${!!h.hcPriority}"></button></div>
+      <p class="help">Chambre, salle de bain, bureau et chambre d'amis chauffent davantage quand le kWh est moins cher (${esc(hcText())}), puis redescendent doucement au lieu d'être maintenus en heures pleines.</p>
+      <div class="grid2"><label class="field"><span>Chambre la nuit (°)</span><input type="number" step="0.5" min="15" max="22" id="h-bedT" value="${h.bedroomT ?? 18}"></label>
+        <label class="field"><span>Chambre d'amis (°)</span><input type="number" step="0.5" min="7" max="20" id="h-guestT" value="${h.guestT ?? 16}"></label></div></div>
+    <div class="card"><h2 class="sec" style="margin-top:0">Salle de bain</h2>
+      <div class="grid2">${time("h-b-wk", h.bath.wk, "Matin en semaine")}${time("h-b-wkEnd", h.bath.wkEnd, "Fin des passages du matin")}${time("h-b-we", h.bath.we, "Matin le week-end")}<span></span>${time("h-b-eve", h.bath.eve, "Soir, début")}${time("h-b-eveEnd", h.bath.eveEnd, "Soir, fin")}</div></div>
     <div class="card"><h2 class="sec" style="margin-top:0">Qui anticipe la montée en température ?</h2>
       <div class="seg" role="group">${[["radiateur", "Les radiateurs"], ["appli", "L'appli"]].map(([v, l]) => `<button type="button" aria-pressed="${(h.anticip || "radiateur") === v}" data-anticip="${v}">${l}</button>`).join("")}</div>
       <p class="help">Les radiateurs : l'option « Anticipation » de Cozytouch est activée, le confort est programmé à l'heure du lever et le radiateur démarre assez tôt pour y être. L'appli : coupe cette option, l'appli avance elle-même la montée selon la vitesse de chauffe mesurée dans chaque pièce (30 min tant qu'elle apprend). Ne combine pas les deux, la pièce chaufferait trop tôt.</p></div>
@@ -1086,6 +1195,9 @@ function saveHabits() {
   habits.tt = [0, 1, 2, 3, 4].map((k) => $(`[data-tt="${k}"]`).checked);
   habits.feel = $("[data-feel][aria-pressed='true']")?.dataset.feel || "normal";
   habits.anticip = $("[data-anticip][aria-pressed='true']")?.dataset.anticip || "radiateur";
+  habits.hcPriority = $("#h-hc")?.getAttribute("aria-checked") === "true";
+  habits.bedroomT = +v("h-bedT") || 18; habits.guestT = +v("h-guestT") || 16;
+  habits.bath = { wk: v("h-b-wk") || "06:00", wkEnd: v("h-b-wkEnd") || "09:30", we: v("h-b-we") || "08:30", eve: v("h-b-eve") || "22:00", eveEnd: v("h-b-eveEnd") || "23:30" };
   document.querySelectorAll("[data-usage]").forEach((s) => { habits.usage[s.dataset.usage] = s.value; });
   habits.done = true; S.editHabits = false;
   store.set("habits", habits);
@@ -1482,7 +1594,7 @@ function minutesToWake() {
 function roomFacts(r) {
   const out = [];
   const d = dutyOf(r.name);
-  if (d) out.push(`chauffe ${nf1.format(d.hours)} h par jour, environ ${nf1.format(d.hours * (r.watts || 1000) / 1000)} kWh`);
+  if (d && d.hours >= 0.1) out.push(`chauffe ${nf1.format(d.hours)} h par jour, environ ${nf1.format(d.hours * (r.watts || 1000) / 1000)} kWh`);
   const h = heatRate(r.name);
   if (h) out.push(`monte de ${nf1.format(h.rate)}° par heure`);
   return out;
@@ -1763,7 +1875,7 @@ function setTab(t) { S.tab = t; store.set("tab", t); render(); window.scrollTo(0
 
 document.addEventListener("click", (e) => {
   if (sheetEl && sheetEl.contains(e.target)) return;
-  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel],[data-anticip],[data-fault-ack],[data-hroom]");
+  const t = e.target.closest("[data-tab],[data-room],[data-act],[data-plan-room],[data-day],[data-level],[data-retry],[data-dismiss],[data-reco],[data-opt-apply],[data-feel],[data-anticip],[data-fault-ack],[data-hroom],#h-hc");
   if (!t) return;
   if (t.dataset.tab) return setTab(t.dataset.tab);
   if (t.dataset.room) return openRoom(+t.dataset.room);
@@ -1789,6 +1901,7 @@ document.addEventListener("click", (e) => {
     }
     return;
   }
+  if (t.id === "h-hc") { t.setAttribute("aria-checked", t.getAttribute("aria-checked") !== "true"); return; }
   if (t.dataset.anticip) { document.querySelectorAll("[data-anticip]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
   if (t.dataset.feel) { document.querySelectorAll("[data-feel]").forEach((b) => b.setAttribute("aria-pressed", b === t)); return; }
   if (t.dataset.reco) { const r = S.recos?.[+t.dataset.reco]; if (r && confirm(`${r.title} ?`)) applyReco(r); return; }
@@ -1829,6 +1942,12 @@ document.addEventListener("click", (e) => {
     const minutes = Math.min(12 * 60, Math.max(60, Math.round((end - min) / 60) * 60));
     const endAt = new Date(Date.now() + minutes * 60000).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
     runJob(`Télétravail : ${r.name} à ${deg(cfg.work.temp)}° jusqu'à ${endAt}`, writesOverride(r, clampT(r, cfg.work.temp), minutes));
+  }
+  if (a === "guests") {
+    const g = guestPair(); if (!g) return;
+    const on = guestModeOn(g);
+    const msg = on ? `Fin des invités ? ${g.guest.name} reprend son programme habituel.` : `${g.guest.name} prend le programme et les températures de ${g.bed.name} (${deg(g.bed.levels[1])}° la nuit). On y va ?`;
+    if (confirm(msg)) runJob(on ? `${g.guest.name} : programme habituel` : `${g.guest.name} : mode invités`, writesGuestMode(g, !on));
   }
   if (a === "vacation") openVacation();
   if (a === "absence-stop") absenceJob("Fin du mode vacances", null, null);
