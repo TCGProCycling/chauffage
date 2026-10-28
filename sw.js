@@ -1,6 +1,6 @@
 // Garde l'appli disponible hors connexion (les données viennent toujours du relais)
-const CACHE = "chauffage-v7";
-const FILES = ["./", "index.html", "app.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
+const CACHE = "chauffage-v8";
+const FILES = ["./", "index.html", "app.js", "manifest.webmanifest", "icon-cadran.svg", "icon-cadran-192.png", "icon-cadran-512.png"];
 self.addEventListener("install", (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", (e) => {
   e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
@@ -18,7 +18,7 @@ self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch { d = { title: "Chauffage", body: e.data ? e.data.text() : "" }; }
   e.waitUntil(self.registration.showNotification(d.title || "Chauffage", {
-    body: d.body || "", tag: d.tag || "chauffage", icon: "icon-192.png", badge: "icon-192.png",
+    body: d.body || "", tag: d.tag || "chauffage", icon: "icon-cadran-192.png", badge: "icon-cadran-192.png",
     data: { tab: d.tag === "bilan" ? "suivi" : "rooms" },
   }));
 });
